@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python3 -m pip --version)",
+      "Bash(apt-get update *)",
+      "Bash(apt-get install *)",
+      "Bash(python3 *)",
+      "Bash(/root/project-SIMC/.venv/bin/pip install *)",
+      "Bash(/root/project-SIMC/.venv/bin/python *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)"
+    ]
+  }
+}
