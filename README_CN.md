@@ -310,4 +310,4 @@ MIT
 
 [English Version (英文版)](README.md)
 
-*由 Claude Code (Anthropic) 生成 — 2026 年 5 月*
+*由 Claude Code (deepseek) (Anthropic) 生成 — 2026 年 5 月*
