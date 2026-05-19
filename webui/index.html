@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Scraper</title>
+    <link rel="stylesheet" href="/webui/css/style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <div class="sidebar-brand">
+            <h1>Scraper</h1>
+        </div>
+        <ul class="nav-links">
+            <li><a href="#dashboard" class="nav-link active" data-page="dashboard">Dashboard</a></li>
+            <li><a href="#new-task" class="nav-link" data-page="new-task">New Task</a></li>
+            <li><a href="#downloads" class="nav-link" data-page="downloads">Downloads</a></li>
+            <li><a href="#settings" class="nav-link" data-page="settings">Settings</a></li>
+            <li><a href="#files" class="nav-link" data-page="files">Files</a></li>
+        </ul>
+        <div class="sidebar-footer">
+            <span id="ws-status" class="ws-status disconnected">Disconnected</span>
+        </div>
+    </nav>
+    <main id="main-content" class="main-content"></main>
+
+    <script src="/webui/js/api.js"></script>
+    <script src="/webui/js/app.js"></script>
+    <script src="/webui/js/dashboard.js"></script>
+    <script src="/webui/js/task-form.js"></script>
+    <script src="/webui/js/downloads.js"></script>
+    <script src="/webui/js/settings.js"></script>
+    <script src="/webui/js/files.js"></script>
+</body>
+</html>
