@@ -52,6 +52,8 @@ async def get_db() -> aiosqlite.Connection:
 
 async def init_db():
     db = await get_db()
-    await db.executescript(SCHEMA_SQL)
-    await db.commit()
-    await db.close()
+    try:
+        await db.executescript(SCHEMA_SQL)
+        await db.commit()
+    finally:
+        await db.close()
