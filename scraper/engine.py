@@ -41,6 +41,15 @@ class ScraperEngine:
             await q.update_task(self.task_id, status="failed", error_msg="Failed to fetch page")
             return
 
+        if decryptors_enabled and page_html:
+            result = await run_pipeline(
+                page_html.encode("utf-8"),
+                decryptors_enabled,
+                decryptor_opts,
+                max_passes=3,
+            )
+            page_html = result.data.decode("utf-8", errors="ignore")
+
         urls = extract_media_urls(page_html, task["url"], include_filters, exclude_filters)
         if not urls:
             await q.update_task(self.task_id, status="completed", total_files=0, done_files=0)
