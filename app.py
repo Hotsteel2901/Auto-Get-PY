@@ -3,7 +3,11 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
+from scraper.task_manager import TaskManager
+
 BASE_DIR = Path(__file__).parent
+
+task_manager = TaskManager()
 
 
 @asynccontextmanager
