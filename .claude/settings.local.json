@@ -11,7 +11,11 @@
       "Bash(git init *)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git config *)"
+      "Bash(git config *)",
+      "Bash(grep -vE '^\\(api|app\\\\.py|db|docs|downloads|requirements\\\\.txt|scraper|tests|webui|__pycache__|\\\\.gitignore|\\\\.venv|\\\\.git\\)$')",
+      "Bash(python *)",
+      "Bash(pip3 list *)",
+      "Bash(.venv/bin/python3 *)"
     ]
   }
 }
