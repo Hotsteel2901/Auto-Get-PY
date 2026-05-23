@@ -3,7 +3,7 @@ import json
 import time
 import aiohttp
 from pathlib import Path
-from scraper.extractor import extract_media_urls
+from scraper.extractor import extract_media_urls, MEDIA_EXTENSIONS
 from scraper.decryptors import register_all, run_pipeline
 from scraper.downloader import Downloader
 
@@ -36,7 +36,60 @@ class ScraperEngine:
         exclude_filters = config.get("url_filters", {}).get("exclude")
         headers = config.get("custom_headers", {})
 
-        page_html = await self._fetch_page(task["url"], headers, timeout)
+        page_html, is_direct_file = await self._fetch_page(task["url"], headers, timeout)
+        
+        if is_direct_file:
+            filename = Downloader.extract_filename(task["url"])
+            await q.create_download(self.task_id, task["url"], filename)
+            await q.update_task(self.task_id, total_files=1, done_files=0)
+            
+            sem = asyncio.Semaphore(concurrency)
+            downloads = await q.list_downloads(self.task_id)
+            
+            done_count = 0
+            start_time = time.time()
+            
+            async def download_one(dl):
+                nonlocal done_count
+                async with sem:
+                    await self._pause_event.wait()
+                    await q.update_download(dl["id"], status="downloading")
+                    
+                    dl_result = await self._downloader.download_file(
+                        url=dl["url"],
+                        output_dir=output_dir,
+                        filename=dl["filename"],
+                        task_id=self.task_id,
+                        dl_id=dl["id"],
+                        progress_callback=self._on_progress,
+                        headers=headers,
+                        timeout=timeout,
+                    )
+                    
+                    if dl_result["status"] == "completed":
+                        await q.update_download(dl["id"], status="completed",
+                                                file_size=dl_result["file_size"])
+                    else:
+                        retry_count = dl.get("retry_count", 0) + 1
+                        if retry_count < max_retries:
+                            await q.update_download(dl["id"], status="pending",
+                                                    retry_count=retry_count,
+                                                    error_msg=dl_result.get("error_msg"))
+                            await asyncio.sleep(2 ** retry_count)
+                            await download_one(dl)
+                        else:
+                            await q.update_download(dl["id"], status="failed",
+                                                    error_msg=dl_result.get("error_msg"))
+                    
+                    done_count += 1
+                    if self._progress_cb:
+                        await self._progress_cb(self.task_id, done_count, 1, dl["filename"], 0)
+            
+            await download_one(downloads[0])
+            await self._pause_event.wait()
+            await q.update_task(self.task_id, status="completed", done_files=done_count)
+            return
+        
         if page_html is None:
             await q.update_task(self.task_id, status="failed", error_msg="Failed to fetch page")
             return
@@ -120,13 +173,35 @@ class ScraperEngine:
         from db import queries as q
         await q.update_download(dl_id, downloaded=downloaded, file_size=total)
 
-    async def _fetch_page(self, url: str, headers: dict, timeout: int) -> str | None:
+    async def _fetch_page(self, url: str, headers: dict, timeout: int) -> tuple[str | None, bool]:
+        """Fetch page content and return (html_content, is_direct_file).
+        
+        Returns:
+            tuple: (html_content or None, is_direct_file boolean)
+            - If URL points directly to a file, returns (None, True)
+            - If URL points to HTML page, returns (html_text, False)
+            - On error, returns (None, False)
+        """
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers,
                                        timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                    if resp.status == 200:
-                        return await resp.text()
+                    if resp.status != 200:
+                        return (None, False)
+                    
+                    content_type = resp.headers.get('Content-Type', '').lower()
+                    content_disposition = resp.headers.get('Content-Disposition', '')
+                    
+                    is_file = (
+                        'application/octet-stream' in content_type or
+                        'attachment' in content_disposition or
+                        any(ext in url.lower() for ext in MEDIA_EXTENSIONS)
+                    )
+                    
+                    if is_file:
+                        return (None, True)
+                    
+                    return (await resp.text(), False)
         except Exception:
             pass
-        return None
+        return (None, False)

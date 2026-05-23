@@ -49,3 +49,31 @@ def test_skip_non_media():
     html = '<a href="/about.html">About</a><a href="/style.css">CSS</a>'
     urls = extract_media_urls(html, "http://example.com")
     assert len(urls) == 0
+
+
+def test_extract_direct_file_links():
+    html = '''
+    <html><body>
+    <a href="https://example.com/download/file123">Download</a>
+    <a href="https://cdn.example.com/media/video.mp4">Video</a>
+    <a href="https://files.example.com/get?file=doc.pdf">PDF</a>
+    </body></html>
+    '''
+    urls = extract_media_urls(html, "http://example.com")
+    assert any("download" in u.lower() for u in urls)
+    assert any(".mp4" in u for u in urls)
+    assert any(".pdf" in u for u in urls)
+
+
+def test_extract_generic_media_urls():
+    html = '''
+    <html><body>
+    <a href="https://example.com/image.jpg">Image</a>
+    <a href="https://example.com/audio.mp3">Audio</a>
+    <a href="https://example.com/archive.zip">Archive</a>
+    </body></html>
+    '''
+    urls = extract_media_urls(html, "http://example.com")
+    assert any(".jpg" in u for u in urls)
+    assert any(".mp3" in u for u in urls)
+    assert any(".zip" in u for u in urls)
