@@ -5,6 +5,8 @@ from app import app
 
 @pytest.fixture
 async def client():
+    from db.schema import init_db
+    await init_db()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac

@@ -3,6 +3,7 @@ import json
 import time
 import aiohttp
 from pathlib import Path
+from urllib.parse import urlparse
 from scraper.extractor import extract_media_urls, MEDIA_EXTENSIONS
 from scraper.decryptors import register_all, run_pipeline
 from scraper.downloader import Downloader
@@ -43,7 +44,6 @@ class ScraperEngine:
             await q.create_download(self.task_id, task["url"], filename)
             await q.update_task(self.task_id, total_files=1, done_files=0)
             
-            sem = asyncio.Semaphore(concurrency)
             downloads = await q.list_downloads(self.task_id)
             
             done_count = 0
@@ -51,9 +51,13 @@ class ScraperEngine:
             
             async def download_one(dl):
                 nonlocal done_count
-                async with sem:
+                async with self._semaphore:
                     await self._pause_event.wait()
+                    await asyncio.sleep(request_delay)
                     await q.update_download(dl["id"], status="downloading")
+                    
+                    out_path = Path(output_dir) / dl["filename"]
+                    resume_from = out_path.stat().st_size if out_path.exists() else 0
                     
                     dl_result = await self._downloader.download_file(
                         url=dl["url"],
@@ -64,6 +68,7 @@ class ScraperEngine:
                         progress_callback=self._on_progress,
                         headers=headers,
                         timeout=timeout,
+                        resume_from=resume_from,
                     )
                     
                     if dl_result["status"] == "completed":
@@ -75,6 +80,7 @@ class ScraperEngine:
                             await q.update_download(dl["id"], status="pending",
                                                     retry_count=retry_count,
                                                     error_msg=dl_result.get("error_msg"))
+                            dl["retry_count"] = retry_count
                             await asyncio.sleep(2 ** retry_count)
                             await download_one(dl)
                         else:
@@ -115,7 +121,6 @@ class ScraperEngine:
         total = len(urls)
         await q.update_task(self.task_id, total_files=total)
 
-        sem = asyncio.Semaphore(concurrency)
         done_count = 0
         start_time = time.time()
 
@@ -123,9 +128,13 @@ class ScraperEngine:
 
         async def download_one(dl):
             nonlocal done_count
-            async with sem:
+            async with self._semaphore:
                 await self._pause_event.wait()
+                await asyncio.sleep(request_delay)
                 await q.update_download(dl["id"], status="downloading")
+
+                out_path = Path(output_dir) / dl["filename"]
+                resume_from = out_path.stat().st_size if out_path.exists() else 0
 
                 dl_result = await self._downloader.download_file(
                     url=dl["url"],
@@ -136,6 +145,7 @@ class ScraperEngine:
                     progress_callback=self._on_progress,
                     headers=headers,
                     timeout=timeout,
+                    resume_from=resume_from,
                 )
 
                 if dl_result["status"] == "completed":
@@ -147,6 +157,7 @@ class ScraperEngine:
                         await q.update_download(dl["id"], status="pending",
                                                 retry_count=retry_count,
                                                 error_msg=dl_result.get("error_msg"))
+                        dl["retry_count"] = retry_count
                         await asyncio.sleep(2 ** retry_count)
                         await download_one(dl)
                     else:
@@ -192,10 +203,11 @@ class ScraperEngine:
                     content_type = resp.headers.get('Content-Type', '').lower()
                     content_disposition = resp.headers.get('Content-Disposition', '')
                     
+                    parsed_path = urlparse(url).path.lower()
                     is_file = (
                         'application/octet-stream' in content_type or
                         'attachment' in content_disposition or
-                        any(ext in url.lower() for ext in MEDIA_EXTENSIONS)
+                        any(parsed_path.endswith(ext) for ext in MEDIA_EXTENSIONS)
                     )
                     
                     if is_file:
