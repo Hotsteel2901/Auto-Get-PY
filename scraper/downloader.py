@@ -50,6 +50,10 @@ class Downloader:
                                 continue
                             return {"status": "failed", "error_msg": f"HTTP {resp.status}"}
 
+                        # If server ignores Range header, reset resume to avoid corruption
+                        if resume_from > 0 and resp.status == 200:
+                            resume_from = 0
+
                         total_size = resp.content_length
                         if total_size:
                             total_size += resume_from

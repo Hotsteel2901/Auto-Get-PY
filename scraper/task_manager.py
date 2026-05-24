@@ -50,6 +50,12 @@ class TaskManager:
         )
         coro = engine.run()
         t = asyncio.create_task(coro)
+
+        def _on_task_done(task_obj: asyncio.Task):
+            self._running_tasks.pop(task_id, None)
+            self._pause_events.pop(task_id, None)
+
+        t.add_done_callback(_on_task_done)
         self._running_tasks[task_id] = t
 
     async def _broadcast_task_progress(self, task_id, done, total, current_file="", speed=0):
@@ -66,7 +72,7 @@ class TaskManager:
     async def resume_task(self, task_id: int):
         from db import queries as q
         task = await q.get_task(task_id)
-        if not task or task["status"] != "paused":
+        if not task or task["status"] not in ("paused",):
             return
         if task_id not in self._running_tasks:
             await q.update_task(task_id, status="pending")

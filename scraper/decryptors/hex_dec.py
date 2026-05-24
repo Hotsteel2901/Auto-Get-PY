@@ -9,7 +9,7 @@ class HexDecoder(BaseDecryptor):
     async def can_handle(self, content: bytes, context: dict) -> bool:
         try:
             text = content.decode("ascii", errors="ignore").strip()
-            return bool(re.fullmatch(r"([0-9a-fA-F]{2})+", text)) and len(text) >= 4
+            return bool(re.fullmatch(r"([0-9a-fA-F]{2})+", text)) and len(text) >= 8
         except Exception:
             return False
 

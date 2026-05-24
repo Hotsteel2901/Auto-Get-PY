@@ -30,7 +30,10 @@ async def websocket_progress(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_text()
-            msg = json.loads(data)
+            try:
+                msg = json.loads(data)
+            except json.JSONDecodeError:
+                continue
             if msg.get("type") == "ping":
                 await ws.send_json({"type": "pong"})
     except WebSocketDisconnect:

@@ -40,6 +40,9 @@ async def get_task(task_id: int):
 @router.put("/{task_id}")
 async def update_task(task_id: int, body: TaskUpdateBody):
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "config" in kwargs:
+        import json
+        kwargs["config"] = json.dumps(kwargs["config"])
     task = await q.update_task(task_id, **kwargs)
     if not task:
         raise HTTPException(404, "Task not found")
