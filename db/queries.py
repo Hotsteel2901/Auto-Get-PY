@@ -1,6 +1,9 @@
 from db.schema import get_db
 import json
 
+_VALID_TASK_COLUMNS = {"name", "url", "status", "config", "total_files", "done_files", "error_msg"}
+_VALID_DOWNLOAD_COLUMNS = {"task_id", "url", "filename", "file_size", "downloaded", "status", "retry_count", "error_msg"}
+
 
 # --- Tasks ---
 
@@ -52,6 +55,9 @@ async def get_task(task_id: int) -> dict | None:
 async def update_task(task_id: int, **kwargs) -> dict | None:
     if not kwargs:
         return await get_task(task_id)
+    invalid = set(kwargs) - _VALID_TASK_COLUMNS
+    if invalid:
+        raise ValueError(f"Invalid column(s) for tasks: {invalid}")
     db = await get_db()
     try:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
@@ -126,6 +132,9 @@ async def get_download(dl_id: int) -> dict | None:
 async def update_download(dl_id: int, **kwargs) -> dict | None:
     if not kwargs:
         return await get_download(dl_id)
+    invalid = set(kwargs) - _VALID_DOWNLOAD_COLUMNS
+    if invalid:
+        raise ValueError(f"Invalid column(s) for downloads: {invalid}")
     db = await get_db()
     try:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
@@ -161,6 +170,19 @@ async def get_failed_downloads(task_id: int) -> list[dict]:
         )
         results = [dict(r) for r in await rows.fetchall()]
         return results
+    finally:
+        await db.close()
+
+
+async def get_existing_download_urls(task_id: int) -> set[str]:
+    db = await get_db()
+    try:
+        rows = await db.execute(
+            "SELECT url FROM downloads WHERE task_id = ?",
+            (task_id,),
+        )
+        results = await rows.fetchall()
+        return {r["url"] for r in results}
     finally:
         await db.close()
 

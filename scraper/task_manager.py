@@ -1,5 +1,4 @@
 import asyncio
-import json
 from scraper.decryptors import register_all
 
 
@@ -25,7 +24,7 @@ class TaskManager:
             except Exception:
                 pass
 
-    async def start_task(self, task_id: int, task_config: dict):
+    async def start_task(self, task_id: int):
         from db import queries as q
         from scraper.engine import ScraperEngine
 
@@ -34,8 +33,6 @@ class TaskManager:
             return
 
         await q.update_task(task_id, status="running")
-        config = json.loads(task["config"]) if task["config"] else {}
-        config.update(task_config)
 
         register_all()
 
@@ -76,7 +73,7 @@ class TaskManager:
             return
         if task_id not in self._running_tasks:
             await q.update_task(task_id, status="pending")
-            await self.start_task(task_id, json.loads(task["config"]))
+            await self.start_task(task_id)
         else:
             self._pause_events[task_id].set()
             await q.update_task(task_id, status="running")
@@ -87,10 +84,7 @@ class TaskManager:
         for dl in failed:
             await q.update_download(dl["id"], status="pending", retry_count=0, error_msg=None)
         await q.update_task(task_id, status="pending")
-        task = await q.get_task(task_id)
-        if task:
-            config = json.loads(task["config"]) if task["config"] else {}
-            await self.start_task(task_id, config)
+        await self.start_task(task_id)
 
     async def shutdown(self):
         for task_id in list(self._running_tasks.keys()):
