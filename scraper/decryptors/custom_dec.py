@@ -24,8 +24,8 @@ class CustomExprDecoder(BaseDecryptor):
                                 raise ValueError(f"Function call not allowed: {node.func.id}")
             local_vars = {"content": content, "bytes": bytes, "int": int, "len": len, "range": range, "list": list, "bytearray": bytearray}
             result = eval(compile(tree, "<custom_expr>", "eval"), {"__builtins__": {}}, local_vars)
-        except (SyntaxError, ValueError):
-            raise
+        except Exception as e:
+            raise ValueError(f"Custom expression error: {e}") from e
         if isinstance(result, str):
             return result.encode("utf-8")
         return bytes(result)

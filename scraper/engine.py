@@ -11,6 +11,27 @@ from scraper.downloader import Downloader
 
 logger = logging.getLogger(__name__)
 
+_BINARY_CONTENT_TYPES = {
+    "application/octet-stream",
+    "application/pdf",
+    "application/zip",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/x-tar",
+    "application/gzip",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/epub+zip",
+}
+
+_BINARY_CONTENT_PREFIXES = ("video/", "audio/", "image/", "font/")
+
 
 class ScraperEngine:
     def __init__(self, task_id: int, semaphore: asyncio.Semaphore,
@@ -20,6 +41,50 @@ class ScraperEngine:
         self._pause_event = pause_event
         self._progress_cb = progress_cb
         self._downloader = Downloader()
+
+    async def _download_item(self, dl, output_dir, headers, timeout, max_retries, request_delay):
+        from db import queries as q
+
+        async with self._semaphore:
+            await self._pause_event.wait()
+            await asyncio.sleep(request_delay)
+
+            retries = 0
+            while True:
+                await q.update_download(dl["id"], status="downloading")
+
+                try:
+                    resume_from = Path(output_dir, dl["filename"]).stat().st_size
+                except FileNotFoundError:
+                    resume_from = 0
+
+                dl_result = await self._downloader.download_file(
+                    url=dl["url"],
+                    output_dir=output_dir,
+                    filename=dl["filename"],
+                    task_id=self.task_id,
+                    dl_id=dl["id"],
+                    progress_callback=self._on_progress,
+                    headers=headers,
+                    timeout=timeout,
+                    resume_from=resume_from,
+                )
+
+                if dl_result["status"] == "completed":
+                    await q.update_download(dl["id"], status="completed",
+                                            file_size=dl_result["file_size"])
+                    return dl_result
+
+                retries += 1
+                if retries < max_retries:
+                    await q.update_download(dl["id"], status="pending",
+                                            retry_count=retries,
+                                            error_msg=dl_result.get("error_msg"))
+                    await asyncio.sleep(2 ** retries)
+                else:
+                    await q.update_download(dl["id"], status="failed",
+                                            error_msg=dl_result.get("error_msg"))
+                    return dl_result
 
     async def run(self):
         from db import queries as q
@@ -52,60 +117,17 @@ class ScraperEngine:
             downloads = [d for d in downloads if d["status"] != "completed"]
 
             if not downloads:
-                await q.update_task(self.task_id, status="completed",
-                                    done_files=await q.count_downloads_by_status(self.task_id, "completed"))
+                completed = await q.count_downloads_by_status(self.task_id, "completed")
+                await q.update_task(self.task_id, status="completed", done_files=completed)
                 return
 
-            done_count = 0
+            result = await self._download_item(
+                downloads[0], output_dir, headers, timeout, max_retries, request_delay)
 
-            async def download_one(dl):
-                nonlocal done_count
-                async with self._semaphore:
-                    await self._pause_event.wait()
-                    await asyncio.sleep(request_delay)
-
-                    retries = 0
-                    while True:
-                        await q.update_download(dl["id"], status="downloading")
-
-                        out_path = Path(output_dir) / dl["filename"]
-                        resume_from = out_path.stat().st_size if out_path.exists() else 0
-
-                        dl_result = await self._downloader.download_file(
-                            url=dl["url"],
-                            output_dir=output_dir,
-                            filename=dl["filename"],
-                            task_id=self.task_id,
-                            dl_id=dl["id"],
-                            progress_callback=self._on_progress,
-                            headers=headers,
-                            timeout=timeout,
-                            resume_from=resume_from,
-                        )
-
-                        if dl_result["status"] == "completed":
-                            await q.update_download(dl["id"], status="completed",
-                                                    file_size=dl_result["file_size"])
-                            break
-
-                        retries += 1
-                        if retries < max_retries:
-                            await q.update_download(dl["id"], status="pending",
-                                                    retry_count=retries,
-                                                    error_msg=dl_result.get("error_msg"))
-                            await asyncio.sleep(2 ** retries)
-                        else:
-                            await q.update_download(dl["id"], status="failed",
-                                                    error_msg=dl_result.get("error_msg"))
-                            break
-
-                    done_count += 1
-                    if self._progress_cb:
-                        await self._progress_cb(self.task_id, done_count, 1, dl["filename"], 0)
-
-            await download_one(downloads[0])
             await self._pause_event.wait()
             completed = await q.count_downloads_by_status(self.task_id, "completed")
+            if self._progress_cb:
+                await self._progress_cb(self.task_id, 1, 1, downloads[0]["filename"], 0)
             await q.update_task(self.task_id, status="completed", done_files=completed)
             return
 
@@ -129,74 +151,43 @@ class ScraperEngine:
             return
 
         existing_urls = await q.get_existing_download_urls(self.task_id)
-        for url in urls:
-            if url not in existing_urls:
-                filename = Downloader.extract_filename(url)
-                await q.create_download(self.task_id, url, filename)
+        new_urls = [url for url in urls if url not in existing_urls]
+        for url in new_urls:
+            filename = Downloader.extract_filename(url)
+            await q.create_download(self.task_id, url, filename)
 
-        total = len(urls)
-        await q.update_task(self.task_id, total_files=total)
-
-        done_count = 0
-        start_time = time.time()
-
-        downloads = await q.list_downloads(self.task_id)
-        downloads = [d for d in downloads if d["status"] != "completed"]
+        all_downloads = await q.list_downloads(self.task_id)
+        total = len(all_downloads)
+        downloads = [d for d in all_downloads if d["status"] != "completed"]
 
         if not downloads:
             completed = await q.count_downloads_by_status(self.task_id, "completed")
             await q.update_task(self.task_id, status="completed", done_files=completed)
             return
 
+        await q.update_task(self.task_id, total_files=total)
+        done_count = 0
+        start_time = time.time()
+
         async def download_one(dl):
             nonlocal done_count
-            async with self._semaphore:
-                await self._pause_event.wait()
-                await asyncio.sleep(request_delay)
-
-                retries = 0
-                while True:
-                    await q.update_download(dl["id"], status="downloading")
-
-                    out_path = Path(output_dir) / dl["filename"]
-                    resume_from = out_path.stat().st_size if out_path.exists() else 0
-
-                    dl_result = await self._downloader.download_file(
-                        url=dl["url"],
-                        output_dir=output_dir,
-                        filename=dl["filename"],
-                        task_id=self.task_id,
-                        dl_id=dl["id"],
-                        progress_callback=self._on_progress,
-                        headers=headers,
-                        timeout=timeout,
-                        resume_from=resume_from,
-                    )
-
-                    if dl_result["status"] == "completed":
-                        await q.update_download(dl["id"], status="completed",
-                                                file_size=dl_result["file_size"])
-                        break
-
-                    retries += 1
-                    if retries < max_retries:
-                        await q.update_download(dl["id"], status="pending",
-                                                retry_count=retries,
-                                                error_msg=dl_result.get("error_msg"))
-                        await asyncio.sleep(2 ** retries)
-                    else:
-                        await q.update_download(dl["id"], status="failed",
-                                                error_msg=dl_result.get("error_msg"))
-                        break
-
+            try:
+                result = await self._download_item(
+                    dl, output_dir, headers, timeout, max_retries, request_delay)
                 done_count += 1
                 elapsed = time.time() - start_time
                 speed = done_count / elapsed if elapsed > 0 else 0
                 if self._progress_cb:
                     await self._progress_cb(self.task_id, done_count, total, dl["filename"], speed)
+            except Exception:
+                logger.exception("Unexpected error downloading %s", dl["url"])
+                done_count += 1
 
         tasks = [download_one(dl) for dl in downloads]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("Download task raised: %s", r)
 
         await self._pause_event.wait()
         completed = await q.count_downloads_by_status(self.task_id, "completed")
@@ -211,14 +202,6 @@ class ScraperEngine:
         await q.update_download(dl_id, downloaded=downloaded, file_size=total)
 
     async def _fetch_page(self, url: str, headers: dict, timeout: int) -> tuple[str | None, bool, str | None]:
-        """Fetch page content and return (html_content, is_direct_file, error_message).
-
-        Returns:
-            tuple: (html_content or None, is_direct_file boolean, error_message or None)
-            - If URL points directly to a file, returns (None, True, None)
-            - If URL points to HTML page, returns (html_text, False, None)
-            - On error, returns (None, False, error_message)
-        """
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers,
@@ -231,7 +214,8 @@ class ScraperEngine:
 
                     parsed_path = urlparse(url).path.lower()
                     is_file = (
-                        'application/octet-stream' in content_type or
+                        any(ct in content_type for ct in _BINARY_CONTENT_TYPES) or
+                        any(content_type.startswith(prefix) for prefix in _BINARY_CONTENT_PREFIXES) or
                         'attachment' in content_disposition or
                         any(parsed_path.endswith(ext) for ext in MEDIA_EXTENSIONS)
                     )

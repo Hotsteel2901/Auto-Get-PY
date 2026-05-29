@@ -18,11 +18,14 @@ class TaskManager:
 
     async def broadcast_progress(self, task_id: int, done: int, total: int,
                                  current_file: str = "", speed: float = 0):
-        for cb in self._progress_callbacks:
+        stale = []
+        for i, cb in enumerate(self._progress_callbacks):
             try:
                 await cb(task_id, done, total, current_file, speed)
             except Exception:
-                pass
+                stale.append(i)
+        for i in reversed(stale):
+            self._progress_callbacks.pop(i)
 
     async def start_task(self, task_id: int):
         from db import queries as q
@@ -87,14 +90,19 @@ class TaskManager:
         await self.start_task(task_id)
 
     async def shutdown(self):
+        tasks_snapshot = list(self._running_tasks.values())
         for task_id in list(self._running_tasks.keys()):
-            await self.pause_task(task_id)
-        for t in self._running_tasks.values():
+            try:
+                await self.pause_task(task_id)
+            except Exception:
+                pass
+        for t in tasks_snapshot:
             t.cancel()
-        for t in self._running_tasks.values():
+        for t in tasks_snapshot:
             try:
                 await t
             except asyncio.CancelledError:
                 pass
         self._running_tasks.clear()
         self._pause_events.clear()
+        self._progress_callbacks.clear()

@@ -36,24 +36,25 @@ def _is_media_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in MEDIA_EXTENSIONS)
 
 
+_DIRECT_SEGMENTS = frozenset({
+    "download", "file", "files", "attachment", "attachments",
+    "media", "video", "audio", "image",
+})
+
+
 def _is_direct_link(url: str) -> bool:
-    """Check if URL is a direct file link (download, image, audio, video, etc)."""
     parsed = urlparse(url)
     path = parsed.path.lower()
-    
-    direct_indicators = [
-        '/download', '/file', '/files', '/attachment', '/attachments',
-        '/get', '/media', '/media/', '/video', '/audio', '/image',
-    ]
-    
-    if any(indicator in path for indicator in direct_indicators):
+
+    path_segments = [s for s in path.split("/") if s]
+    if any(seg in _DIRECT_SEGMENTS for seg in path_segments):
         return True
-    
+
     if parsed.query:
         query_params = parsed.query.lower()
         if 'download' in query_params or 'file=' in query_params:
             return True
-    
+
     return _is_media_url(url)
 
 
