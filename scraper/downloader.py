@@ -1,5 +1,5 @@
-import re
 import asyncio
+import re
 import aiohttp
 import aiofiles
 from pathlib import Path
@@ -9,10 +9,9 @@ from urllib.parse import urlparse
 class Downloader:
     CHUNK_SIZE = 64 * 1024
 
-    def __init__(self, output_dir: str = "./downloads", max_retries: int = 3):
+    def __init__(self, output_dir: str = "./downloads"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.max_retries = max_retries
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
@@ -35,53 +34,40 @@ class Downloader:
         fname = filename or self.extract_filename(url)
         filepath = out_dir / fname
 
-        for attempt in range(self.max_retries):
-            try:
-                req_headers = headers.copy() if headers else {}
-                if resume_from > 0:
-                    req_headers["Range"] = f"bytes={resume_from}-"
+        try:
+            req_headers = headers.copy() if headers else {}
+            if resume_from > 0:
+                req_headers["Range"] = f"bytes={resume_from}-"
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, headers=req_headers,
-                                           timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-                        if resp.status not in (200, 206):
-                            if attempt < self.max_retries - 1:
-                                await asyncio.sleep(2 ** attempt)
-                                continue
-                            return {"status": "failed", "error_msg": f"HTTP {resp.status}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=req_headers,
+                                       timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                    if resp.status not in (200, 206):
+                        return {"status": "failed", "error_msg": f"HTTP {resp.status}"}
 
-                        # If server ignores Range header, reset resume to avoid corruption
-                        if resume_from > 0 and resp.status == 200:
-                            resume_from = 0
+                    if resume_from > 0 and resp.status == 200:
+                        resume_from = 0
 
-                        total_size = resp.content_length
-                        if total_size:
-                            total_size += resume_from
+                    total_size = resp.content_length
+                    if total_size and resume_from > 0:
+                        total_size += resume_from
 
-                        mode = "ab" if resume_from > 0 else "wb"
-                        async with aiofiles.open(filepath, mode) as f:
-                            downloaded = resume_from
-                            async for chunk in resp.content.iter_chunked(self.CHUNK_SIZE):
-                                await f.write(chunk)
-                                downloaded += len(chunk)
-                                if progress_callback and task_id and dl_id:
-                                    await progress_callback(task_id, dl_id, downloaded, total_size)
+                    mode = "ab" if resume_from > 0 else "wb"
+                    async with aiofiles.open(filepath, mode) as f:
+                        downloaded = resume_from
+                        async for chunk in resp.content.iter_chunked(self.CHUNK_SIZE):
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback and task_id and dl_id:
+                                await progress_callback(task_id, dl_id, downloaded, total_size)
 
-                        return {
-                            "status": "completed",
-                            "file_size": downloaded,
-                            "filename": fname,
-                            "filepath": str(filepath),
-                        }
-            except asyncio.TimeoutError:
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return {"status": "failed", "error_msg": "Timeout"}
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return {"status": "failed", "error_msg": str(e)}
-
-        return {"status": "failed", "error_msg": "Max retries exceeded"}
+                    return {
+                        "status": "completed",
+                        "file_size": downloaded,
+                        "filename": fname,
+                        "filepath": str(filepath),
+                    }
+        except asyncio.TimeoutError:
+            return {"status": "failed", "error_msg": "Timeout"}
+        except Exception as e:
+            return {"status": "failed", "error_msg": str(e)}

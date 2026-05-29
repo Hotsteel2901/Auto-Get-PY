@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from db import queries as q
@@ -12,9 +14,9 @@ class TaskCreateBody(BaseModel):
 
 
 class TaskUpdateBody(BaseModel):
-    name: str = None
-    url: str = None
-    config: dict = None
+    name: Optional[str] = None
+    url: Optional[str] = None
+    config: Optional[dict] = None
 
 
 @router.get("")

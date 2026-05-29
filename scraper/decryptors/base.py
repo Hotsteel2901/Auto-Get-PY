@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,16 +39,22 @@ def get_enabled_decryptors(enabled_names: list[str]) -> list[BaseDecryptor]:
 
 
 async def run_pipeline(content: bytes, enabled_names: list[str], context: dict,
-                       max_passes: int = 3) -> DecryptorResult:
+                      max_passes: int = 3) -> DecryptorResult:
     decryptors = get_enabled_decryptors(enabled_names)
+    if not decryptors:
+        return DecryptorResult(success=True, data=content)
     current = content
     for _ in range(max_passes):
         handled = False
         for dec in decryptors:
-            if await dec.can_handle(current, context):
-                current = await dec.decrypt(current, context)
-                handled = True
-                break
+            try:
+                if await dec.can_handle(current, context):
+                    current = await dec.decrypt(current, context)
+                    handled = True
+                    break
+            except Exception as e:
+                logger.warning("Decryptor %s failed: %s", dec.name, e)
+                continue
         if not handled:
             break
     return DecryptorResult(success=True, data=current)

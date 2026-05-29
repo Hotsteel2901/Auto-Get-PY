@@ -5,9 +5,18 @@ from fastapi.responses import FileResponse
 router = APIRouter(prefix="/api/files", tags=["files"])
 
 
-def _resolve_allowed_path(dir: str) -> Path:
-    allowed_base = Path("./downloads").resolve()
-    base = Path(dir).resolve()
+async def _get_allowed_base() -> Path:
+    from db import queries as q
+    try:
+        settings = await q.get_settings()
+        default_dir = settings.get("default_output_dir", "./downloads")
+    except Exception:
+        default_dir = "./downloads"
+    return Path(default_dir).resolve()
+
+
+def _resolve_allowed_path(directory: str, allowed_base: Path) -> Path:
+    base = Path(directory).resolve()
     try:
         base.relative_to(allowed_base)
     except ValueError:
@@ -16,8 +25,10 @@ def _resolve_allowed_path(dir: str) -> Path:
 
 
 @router.get("")
-async def list_files(dir: str = "./downloads"):
-    base = _resolve_allowed_path(dir)
+async def list_files(dir: str = None):
+    allowed_base = await _get_allowed_base()
+    target = dir or str(allowed_base)
+    base = _resolve_allowed_path(target, allowed_base)
     if not base.exists():
         return {"files": []}
     files = []
@@ -34,8 +45,10 @@ async def list_files(dir: str = "./downloads"):
 
 
 @router.get("/download/{filename:path}")
-async def download_file(filename: str, dir: str = "./downloads"):
-    base = _resolve_allowed_path(dir)
+async def download_file(filename: str, dir: str = None):
+    allowed_base = await _get_allowed_base()
+    target = dir or str(allowed_base)
+    base = _resolve_allowed_path(target, allowed_base)
     filepath = base / filename
     try:
         filepath.relative_to(base)
