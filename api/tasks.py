@@ -63,9 +63,7 @@ async def start_task(task_id: int):
     task = await q.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    import json
-    config = json.loads(task["config"]) if task["config"] else {}
-    await task_manager.start_task(task_id, config)
+    await task_manager.start_task(task_id)
     return {"ok": True}
 
 

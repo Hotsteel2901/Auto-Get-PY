@@ -16,7 +16,8 @@ from scraper.decryptors.custom_dec import CustomExprDecoder
 
 def register_all():
     from scraper.decryptors.base import _registry
-    _registry.clear()
+    if _registry:
+        return
     register(Base64Decoder())
     register(HexDecoder())
     register(Rot47Decoder())

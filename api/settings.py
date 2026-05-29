@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Body
 from db import queries as q
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -11,8 +11,8 @@ async def get_settings():
 
 
 @router.put("")
-async def update_settings(body: dict):
-    for key, value in body.items():
-        await q.update_setting(key, str(value) if not isinstance(value, str) else value)
-    settings = await q.get_settings()
-    return {"settings": settings}
+async def update_settings(settings: dict[str, str] = Body(..., embed=False)):
+    for key, value in settings.items():
+        await q.update_setting(key, value)
+    settings_result = await q.get_settings()
+    return {"settings": settings_result}
