@@ -83,4 +83,7 @@ def test_sanitize_filename():
 
 def test_extract_filename():
     assert Downloader.extract_filename("http://example.com/path/to/file.jpg") == "file.jpg"
-    assert Downloader.extract_filename("http://example.com/") == "unnamed"
+    # Root URL generates a hash-based name (not "unnamed")
+    root_name = Downloader.extract_filename("http://example.com/")
+    assert root_name != "unnamed"
+    assert root_name.endswith(".bin")

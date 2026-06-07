@@ -18,6 +18,12 @@ async def lifespan(app: FastAPI):
     register_all()
     yield
     await task_manager.shutdown()
+    # Close Playwright browser if it was used
+    try:
+        from scraper.browser import close_browser
+        await close_browser()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Web Scraper", lifespan=lifespan)
@@ -27,12 +33,14 @@ from api.downloads import router as downloads_router
 from api.settings import router as settings_router
 from api.files import router as files_router
 from api.websocket import router as ws_router
+from api.hermes import router as hermes_router
 
 app.include_router(tasks_router)
 app.include_router(downloads_router)
 app.include_router(settings_router)
 app.include_router(files_router)
 app.include_router(ws_router)
+app.include_router(hermes_router)
 
 webui_path = BASE_DIR / "webui"
 if webui_path.exists():

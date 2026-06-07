@@ -6,3 +6,4 @@ aiosqlite==0.20.0
 pydantic==2.10.4
 pycryptodome==3.23.0
 httpx==0.28.1
+playwright>=1.40.0

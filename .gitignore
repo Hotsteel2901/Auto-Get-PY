@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.db
+.pytest_cache/
+downloads/*
+!downloads/.gitkeep
