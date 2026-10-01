@@ -9,7 +9,6 @@ committed to the repository can never drift apart.
 from __future__ import annotations
 
 import json
-from datetime import date
 
 from api.agent_registry import AGENTS, AgentDescriptor
 
@@ -286,8 +285,8 @@ def render_agent_doc(agent: AgentDescriptor, base_url: str = DEFAULT_BASE_URL) -
     return f"""\
 # {PROJECT_NAME} integration — {agent.name}
 
-> Generated from `api/agent_registry.py` on {date.today().isoformat()}.
-> Do not edit by hand; run `python scripts/generate_agent_docs.py`.
+> Generated from `api/agent_registry.py` — do not edit by hand.
+> Refresh with `python scripts/generate_agent_docs.py`.
 
 **Vendor:** {agent.vendor}
 **URL alias:** `{agent.primary_prefix}` (canonical: `{agent.api_prefix}`)

@@ -1,7 +1,7 @@
 # Auto-Get-PY integration — Roo Code
 
-> Generated from `api/agent_registry.py` on 2026-10-01.
-> Do not edit by hand; run `python scripts/generate_agent_docs.py`.
+> Generated from `api/agent_registry.py` — do not edit by hand.
+> Refresh with `python scripts/generate_agent_docs.py`.
 
 **Vendor:** Roo
 **URL alias:** `/api/roo` (canonical: `/api/agent`)

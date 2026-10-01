@@ -19,3 +19,4 @@ playwright>=1.49.0
 httpx>=0.28.1          # ASGI transport for the API tests
 pytest>=8.3.0
 pytest-asyncio>=0.24.0
+pyyaml>=6.0.0          # validates the generated YAML config
