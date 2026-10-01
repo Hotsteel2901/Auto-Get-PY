@@ -842,6 +842,23 @@ class ScraperEngine:
             finally:
                 queue.task_done()
 
+    async def _record(self, dl_id: int, **fields) -> None:
+        """Update a download row without letting bookkeeping abort the transfer.
+
+        The bytes are already on disk by the time some of these run; failing the
+        download because the status write lost a race with another writer would
+        throw away real work. `db.queries` retries lock contention first, so
+        reaching this handler means something genuinely unexpected happened,
+        and it is logged rather than swallowed silently.
+        """
+        from db import queries as q
+
+        try:
+            await q.update_download(dl_id, **fields)
+        except Exception:  # noqa: BLE001
+            logger.warning("[Task %d] could not record download %s state %s",
+                           self.task_id, dl_id, sorted(fields), exc_info=True)
+
     async def _download_one(self, download: dict, config: CrawlConfig) -> None:
         from db import queries as q
 
@@ -862,14 +879,14 @@ class ScraperEngine:
             attempt = 0
             while True:
                 attempt += 1
-                await q.update_download(download["id"], status="downloading",
-                                        error_msg=None)
+                await self._record(download["id"], status="downloading",
+                                   error_msg=None)
 
                 resume_from = target.stat().st_size if target.exists() else 0
                 if resume_from and download.get("file_size") \
                         and resume_from >= download["file_size"]:
                     # Already complete on disk from an earlier run.
-                    await q.update_download(
+                    await self._record(
                         download["id"], status="completed", downloaded=resume_from,
                         filepath=str(target))
                     await self._bump_progress(filename)
@@ -891,7 +908,7 @@ class ScraperEngine:
                 )
 
                 if result.ok:
-                    await q.update_download(
+                    await self._record(
                         download["id"],
                         status="completed",
                         filename=result.get("filename") or filename,
@@ -907,8 +924,8 @@ class ScraperEngine:
 
                 error = result.get("error_msg") or "unknown error"
                 if attempt > config.max_retries:
-                    await q.update_download(download["id"], status="failed",
-                                            error_msg=error, retry_count=attempt - 1)
+                    await self._record(download["id"], status="failed",
+                                       error_msg=error, retry_count=attempt - 1)
                     await self._bump_progress(filename)
                     logger.warning("[Task %d] gave up on %s: %s",
                                    self.task_id, url, error)
@@ -916,8 +933,8 @@ class ScraperEngine:
 
                 backoff = result.get("retry_after") or min(2 ** attempt, 60)
                 backoff += random.uniform(0, 1.5)
-                await q.update_download(download["id"], status="pending",
-                                        error_msg=error, retry_count=attempt - 1)
+                await self._record(download["id"], status="pending",
+                                   error_msg=error, retry_count=attempt - 1)
                 logger.debug("[Task %d] retry %d/%d for %s in %.1fs (%s)",
                              self.task_id, attempt, config.max_retries, url,
                              backoff, error)

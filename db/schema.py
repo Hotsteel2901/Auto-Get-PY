@@ -85,13 +85,34 @@ DEFAULT_SETTINGS = {
     "default_decryptors": '["base64","hex"]',
 }
 
+# How long SQLite waits for a competing writer before giving up. The download
+# workers write progress from several tasks at once, so contention is normal.
+DB_TIMEOUT_SEC = 30.0
+
 
 async def get_db() -> aiosqlite.Connection:
-    db = await aiosqlite.connect(str(DB_PATH))
+    """Open a connection tuned for many short-lived concurrent writers.
+
+    Three details matter here, and getting any of them wrong shows up as
+    ``sqlite3.OperationalError: database is locked`` under load:
+
+    * ``busy_timeout`` is set **first**. Setting the journal mode takes a lock,
+      and while the timeout is still 0 that lock attempt fails instantly
+      instead of waiting for the other writer.
+    * ``isolation_level=None`` puts the connection in autocommit. The default
+      defers a transaction until the first write, which in WAL mode acquires a
+      read snapshot and then has to upgrade — an upgrade that returns
+      ``SQLITE_BUSY_SNAPSHOT``, which ``busy_timeout`` does not retry. Every
+      statement here is self-contained, so autocommit is both correct and
+      cheaper. Multi-statement work opens a transaction explicitly.
+    * ``timeout`` is the sqlite3 driver's own busy timeout, which applies even
+      before the pragma is executed.
+    """
+    db = await aiosqlite.connect(
+        str(DB_PATH), timeout=DB_TIMEOUT_SEC, isolation_level=None)
     db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(f"PRAGMA busy_timeout={int(DB_TIMEOUT_SEC * 1000)}")
     await db.execute("PRAGMA foreign_keys=ON")
-    await db.execute("PRAGMA busy_timeout=5000")
     return db
 
 
@@ -116,12 +137,20 @@ async def _apply_migrations(db: aiosqlite.Connection) -> list[str]:
 
 
 async def init_db() -> None:
-    """Create the schema if needed and migrate an existing database in place."""
+    """Create the schema if needed and migrate an existing database in place.
+
+    This is the only place the journal mode is set: WAL is a property of the
+    database file, and switching it needs an exclusive lock, so it must not
+    race with the worker connections. Nothing else is connected at startup.
+    """
     db = await get_db()
     try:
+        await db.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL is the documented safe pairing: durable across process
+        # crashes, and far fewer fsyncs than FULL under a write-heavy load.
+        await db.execute("PRAGMA synchronous=NORMAL")
         await db.executescript(SCHEMA_SQL)
         await _apply_migrations(db)
-        await db.commit()
     finally:
         await db.close()
 
@@ -135,6 +164,5 @@ async def reset_db() -> None:
             "DROP TABLE IF EXISTS tasks;"
             "DROP TABLE IF EXISTS settings;"
         )
-        await db.commit()
     finally:
         await db.close()

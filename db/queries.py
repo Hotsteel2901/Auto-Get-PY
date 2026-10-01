@@ -1,14 +1,22 @@
 """Async data-access helpers.
 
-Every function opens a short-lived connection; SQLite in WAL mode handles that
-cheaply and it keeps the call sites free of connection lifetime concerns.
+Every function opens a short-lived connection. Connections run in autocommit
+(see :func:`db.schema.get_db`) so a single statement is its own transaction —
+which is what almost every function here is. Multi-statement writes open a
+transaction explicitly. The ``commit()`` calls that remain are no-ops in
+autocommit and are kept so the helpers keep working if that ever changes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import sqlite3
 
 from db.schema import get_db
+
+logger = logging.getLogger(__name__)
 
 _VALID_TASK_COLUMNS = {
     "name", "url", "status", "config", "total_files", "done_files",
@@ -21,6 +29,38 @@ _VALID_DOWNLOAD_COLUMNS = {
 
 # Task states that mean "no further progress will happen on its own".
 TERMINAL_TASK_STATUSES = ("completed", "failed", "cancelled")
+
+# SQLite reports contention through OperationalError. With ``busy_timeout``
+# set (see db.schema.get_db) most of these are absorbed inside SQLite itself;
+# the ones that still surface are WAL snapshot conflicts, which are retried
+# here because the correct response is simply to try again.
+_LOCK_HINTS = (
+    "database is locked",
+    "database table is locked",
+    "database schema is locked",
+    "database is busy",
+)
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    return (isinstance(exc, sqlite3.OperationalError)
+            and any(hint in str(exc).lower() for hint in _LOCK_HINTS))
+
+
+async def retry_on_lock(operation, *args, attempts: int = 5, **kwargs):
+    """Run ``operation``, retrying while SQLite reports contention."""
+    delay = 0.05
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised when not a lock
+            if attempt >= attempts or not _is_lock_error(exc):
+                raise
+            logger.debug("SQLite busy, retrying %s (%d/%d)",
+                         getattr(operation, "__name__", "query"), attempt, attempts)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 1.0)
+    return None  # unreachable
 
 
 def _json_or(raw, fallback):
@@ -121,6 +161,10 @@ async def update_task(task_id: int, **kwargs) -> dict | None:
     invalid = set(kwargs) - _VALID_TASK_COLUMNS
     if invalid:
         raise ValueError(f"Invalid column(s) for tasks: {invalid}")
+    return await retry_on_lock(_update_task_impl, task_id, kwargs)
+
+
+async def _update_task_impl(task_id: int, kwargs: dict) -> dict | None:
     db = await get_db()
     try:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
@@ -129,7 +173,6 @@ async def update_task(task_id: int, **kwargs) -> dict | None:
         vals.append(task_id)
         await db.execute(
             f"UPDATE tasks SET {sets}, updated_at = datetime('now') WHERE id = ?", vals)
-        await db.commit()
         cur = await db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
         row = await cur.fetchone()
         return _decorate_task(dict(row)) if row else None
@@ -188,13 +231,25 @@ async def create_downloads_bulk(task_id: int, items: list[tuple[str, str, str | 
     """Insert many ``(url, filename, referer)`` rows in one transaction."""
     if not items:
         return 0
+    return await retry_on_lock(_create_downloads_bulk_impl, task_id, items)
+
+
+async def _create_downloads_bulk_impl(task_id: int,
+                                      items: list[tuple[str, str, str | None]]) -> int:
     db = await get_db()
     try:
-        await db.executemany(
-            "INSERT INTO downloads (task_id, url, filename, referer) VALUES (?, ?, ?, ?)",
-            [(task_id, url, fname, ref) for url, fname, ref in items],
-        )
-        await db.commit()
+        # Connections are in autocommit, so the batch needs an explicit
+        # transaction: one commit for N rows instead of N commits.
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.executemany(
+                "INSERT INTO downloads (task_id, url, filename, referer) VALUES (?, ?, ?, ?)",
+                [(task_id, url, fname, ref) for url, fname, ref in items],
+            )
+        except BaseException:
+            await db.execute("ROLLBACK")
+            raise
+        await db.execute("COMMIT")
         return len(items)
     finally:
         await db.close()
@@ -256,13 +311,16 @@ async def update_download(dl_id: int, **kwargs) -> dict | None:
     invalid = set(kwargs) - _VALID_DOWNLOAD_COLUMNS
     if invalid:
         raise ValueError(f"Invalid column(s) for downloads: {invalid}")
+    return await retry_on_lock(_update_download_impl, dl_id, kwargs)
+
+
+async def _update_download_impl(dl_id: int, kwargs: dict) -> dict | None:
     db = await get_db()
     try:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [dl_id]
         await db.execute(
             f"UPDATE downloads SET {sets}, updated_at = datetime('now') WHERE id = ?", vals)
-        await db.commit()
         cur = await db.execute("SELECT * FROM downloads WHERE id = ?", (dl_id,))
         row = await cur.fetchone()
         return _decorate_download(dict(row)) if row else None
@@ -273,6 +331,11 @@ async def update_download(dl_id: int, **kwargs) -> dict | None:
 async def update_download_progress(dl_id: int, downloaded: int,
                                    file_size: int | None = None) -> None:
     """Hot path: only touch the byte counters."""
+    await retry_on_lock(_update_download_progress_impl, dl_id, downloaded, file_size)
+
+
+async def _update_download_progress_impl(dl_id: int, downloaded: int,
+                                         file_size: int | None) -> None:
     db = await get_db()
     try:
         if file_size:
@@ -283,7 +346,6 @@ async def update_download_progress(dl_id: int, downloaded: int,
         else:
             await db.execute(
                 "UPDATE downloads SET downloaded = ? WHERE id = ?", (downloaded, dl_id))
-        await db.commit()
     finally:
         await db.close()
 

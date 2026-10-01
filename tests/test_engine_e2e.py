@@ -406,3 +406,40 @@ async def test_records_are_never_left_downloading(local_site, run_task):
     assert downloads
     assert all(d["status"] in ("completed", "failed") for d in downloads), \
         [d["status"] for d in downloads if d["status"] not in ("completed", "failed")]
+
+
+async def test_a_bookkeeping_failure_does_not_lose_the_download(local_site, run_task,
+                                                                monkeypatch):
+    """The bytes are on disk before the status write.
+
+    CI once failed a whole task because the progress bookkeeping hit
+    `database is locked`. A status write losing a race must never throw away a
+    file that has already been transferred.
+    """
+    from db import queries as q
+
+    real_update = q.update_download
+    state = {"calls": 0, "failures": 0}
+
+    async def flaky(dl_id, **fields):
+        state["calls"] += 1
+        if state["calls"] % 2 == 0:
+            state["failures"] += 1
+            raise RuntimeError("simulated bookkeeping failure")
+        return await real_update(dl_id, **fields)
+
+    monkeypatch.setattr(q, "update_download", flaky)
+
+    task, downloads, out = await run_task(
+        local_site.url,
+        {"crawl_depth": 0, "follow_pagination": False, "follow_links": False,
+         "crawl_css": False, "crawl_iframes": False},
+    )
+
+    assert state["failures"] > 0, "the test did not actually inject any failures"
+
+    # The engine kept going: files are on disk and the task finished.
+    assert task["status"] == "completed", task["error_msg"]
+    on_disk = files_on_disk(out)
+    assert "hero.jpg" in on_disk
+    assert len(on_disk) >= 10, f"only {len(on_disk)} files survived"
