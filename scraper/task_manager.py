@@ -1,5 +1,17 @@
+"""Task lifecycle: start, pause, resume, cancel, retry.
+
+One :class:`TaskManager` instance owns every running scrape.  Its job is to
+keep the database honest: a task that crashes must end up ``failed`` rather
+than sitting in ``running`` forever, and a task that is cancelled must stop
+without leaving orphan work behind.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from scraper.decryptors import register_all
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class TaskManager:
@@ -7,102 +19,234 @@ class TaskManager:
         self._semaphore = asyncio.Semaphore(max_global_concurrency)
         self._running_tasks: dict[int, asyncio.Task] = {}
         self._pause_events: dict[int, asyncio.Event] = {}
-        self._progress_callbacks: list = []
+        self._engines: dict[int, object] = {}
+        self._listeners: list = []
 
-    def register_progress_callback(self, cb):
-        self._progress_callbacks.append(cb)
+    # ── Progress fan-out ────────────────────────────────────────────────────
 
-    def unregister_progress_callback(self, cb):
-        if cb in self._progress_callbacks:
-            self._progress_callbacks.remove(cb)
+    def register_progress_callback(self, cb) -> None:
+        """Subscribe to progress payloads (dicts)."""
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def unregister_progress_callback(self, cb) -> None:
+        try:
+            self._listeners.remove(cb)
+        except ValueError:
+            pass
+
+    @property
+    def listener_count(self) -> int:
+        return len(self._listeners)
+
+    async def broadcast(self, payload: dict) -> None:
+        """Send a payload to every subscriber, dropping dead ones."""
+        if not self._listeners:
+            return
+        results = await asyncio.gather(
+            *(self._safe_call(cb, payload) for cb in self._listeners),
+            return_exceptions=True)
+        dead = [cb for cb, ok in zip(list(self._listeners), results) if ok is False]
+        for cb in dead:
+            self.unregister_progress_callback(cb)
+
+    @staticmethod
+    async def _safe_call(cb, payload):
+        try:
+            result = await cb(payload)
+        except Exception:  # noqa: BLE001 - a broken socket is not a fatal error
+            return False
+        return False if result is False else True
 
     async def broadcast_progress(self, task_id: int, done: int, total: int,
-                                 current_file: str = "", speed: float = 0):
-        stale = []
-        for i, cb in enumerate(self._progress_callbacks):
-            try:
-                await cb(task_id, done, total, current_file, speed)
-            except Exception:
-                stale.append(i)
-        for i in reversed(stale):
-            self._progress_callbacks.pop(i)
+                                 current_file: str = "", speed: float = 0.0) -> None:
+        await self.broadcast({
+            "type": "progress",
+            "task_id": task_id,
+            "done": done,
+            "total": total,
+            "current_file": current_file,
+            "speed": round(speed, 2),
+            "percent": round(done / total * 100, 1) if total else 0.0,
+        })
 
-    async def start_task(self, task_id: int):
+    async def broadcast_file_progress(self, task_id: int, dl_id: int,
+                                      downloaded: int, total: int | None) -> None:
+        await self.broadcast({
+            "type": "file_progress",
+            "task_id": task_id,
+            "download_id": dl_id,
+            "downloaded": downloaded,
+            "total": total,
+            "percent": round(downloaded / total * 100, 1) if total else None,
+        })
+
+    async def broadcast_task_status(self, task_id: int, status: str,
+                                    error: str | None = None) -> None:
+        await self.broadcast({
+            "type": "task_status",
+            "task_id": task_id,
+            "status": status,
+            "error": error,
+        })
+
+    # ── Introspection ───────────────────────────────────────────────────────
+
+    def is_running(self, task_id: int) -> bool:
+        task = self._running_tasks.get(task_id)
+        return bool(task and not task.done())
+
+    @property
+    def running_task_ids(self) -> list[int]:
+        return [tid for tid, t in self._running_tasks.items() if not t.done()]
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    async def start_task(self, task_id: int, force: bool = False) -> bool:
+        """Launch the engine for a task. Returns True when it was started."""
         from db import queries as q
+        from scraper.decryptors import register_all
         from scraper.engine import ScraperEngine
 
-        task = await q.get_task(task_id)
-        if not task or task["status"] != "pending":
-            return
+        if self.is_running(task_id):
+            logger.debug("Task %s is already running", task_id)
+            return False
 
-        await q.update_task(task_id, status="running")
+        task = await q.get_task(task_id)
+        if not task:
+            logger.warning("Cannot start task %s: not found", task_id)
+            return False
+        if not force and task["status"] not in ("pending", "paused", "failed", "cancelled"):
+            return False
 
         register_all()
+        await q.update_task(task_id, status="running", error_msg=None)
+        await self.broadcast_task_status(task_id, "running")
 
-        self._pause_events[task_id] = asyncio.Event()
-        self._pause_events[task_id].set()
+        pause_event = asyncio.Event()
+        pause_event.set()
+        self._pause_events[task_id] = pause_event
 
         engine = ScraperEngine(
             task_id=task_id,
             semaphore=self._semaphore,
-            pause_event=self._pause_events[task_id],
-            progress_cb=self._broadcast_task_progress,
+            pause_event=pause_event,
+            progress_cb=self.broadcast_progress,
+            file_progress_cb=self.broadcast_file_progress,
         )
-        coro = engine.run()
-        t = asyncio.create_task(coro)
+        self._engines[task_id] = engine
 
-        def _on_task_done(task_obj: asyncio.Task):
+        runner = asyncio.create_task(self._run_engine(task_id, engine))
+        self._running_tasks[task_id] = runner
+        return True
+
+    async def _run_engine(self, task_id: int, engine) -> None:
+        """Run the engine, mapping any outcome onto a terminal task status."""
+        from db import queries as q
+
+        status, error = "completed", None
+        try:
+            await engine.run()
+        except asyncio.CancelledError:
+            status, error = "cancelled", "Task cancelled"
+            raise
+        except Exception as exc:  # noqa: BLE001 - never leave a task "running"
+            logger.exception("Task %s crashed", task_id)
+            status, error = "failed", f"{type(exc).__name__}: {exc}"
+        finally:
             self._running_tasks.pop(task_id, None)
             self._pause_events.pop(task_id, None)
+            self._engines.pop(task_id, None)
 
-        t.add_done_callback(_on_task_done)
-        self._running_tasks[task_id] = t
+            fresh = await q.get_task(task_id)
+            if fresh and fresh["status"] in ("running", "pending"):
+                await q.update_task(task_id, status=status, error_msg=error)
+                try:
+                    await self.broadcast_task_status(task_id, status, error)
+                except Exception:  # noqa: BLE001
+                    pass
 
-    async def _broadcast_task_progress(self, task_id, done, total, current_file="", speed=0):
-        await self.broadcast_progress(task_id, done, total, current_file, speed)
+    async def pause_task(self, task_id: int) -> None:
         from db import queries as q
-        await q.update_task(task_id, done_files=done, total_files=total)
 
-    async def pause_task(self, task_id: int):
-        if task_id in self._pause_events:
-            self._pause_events[task_id].clear()
-        from db import queries as q
+        event = self._pause_events.get(task_id)
+        if event is not None:
+            event.clear()
         await q.update_task(task_id, status="paused")
+        await self.broadcast_task_status(task_id, "paused")
 
-    async def resume_task(self, task_id: int):
+    async def resume_task(self, task_id: int) -> bool:
         from db import queries as q
+
         task = await q.get_task(task_id)
-        if not task or task["status"] not in ("paused",):
-            return
-        if task_id not in self._running_tasks:
-            await q.update_task(task_id, status="pending")
-            await self.start_task(task_id)
-        else:
+        if not task:
+            return False
+
+        if task_id in self._pause_events and self.is_running(task_id):
             self._pause_events[task_id].set()
             await q.update_task(task_id, status="running")
+            await self.broadcast_task_status(task_id, "running")
+            return True
 
-    async def retry_task(self, task_id: int):
-        from db import queries as q
-        failed = await q.get_failed_downloads(task_id)
-        for dl in failed:
-            await q.update_download(dl["id"], status="pending", retry_count=0, error_msg=None)
+        # Nothing is running: restart from the persisted state.
+        await q.requeue_downloads(task_id, ("failed",))
         await q.update_task(task_id, status="pending")
-        await self.start_task(task_id)
+        return await self.start_task(task_id, force=True)
 
-    async def shutdown(self):
-        tasks_snapshot = list(self._running_tasks.values())
-        for task_id in list(self._running_tasks.keys()):
+    async def cancel_task(self, task_id: int) -> None:
+        from db import queries as q
+
+        engine = self._engines.get(task_id)
+        if engine is not None:
+            engine.cancel()
+
+        runner = self._running_tasks.get(task_id)
+        if runner and not runner.done():
+            runner.cancel()
             try:
-                await self.pause_task(task_id)
-            except Exception:
+                await runner
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        for t in tasks_snapshot:
-            t.cancel()
-        for t in tasks_snapshot:
+
+        self._pause_events.pop(task_id, None)
+        self._engines.pop(task_id, None)
+        self._running_tasks.pop(task_id, None)
+
+        await q.requeue_downloads(task_id, ("downloading", "pending"))
+        await q.update_task(task_id, status="cancelled")
+        await self.broadcast_task_status(task_id, "cancelled")
+
+    async def retry_task(self, task_id: int) -> bool:
+        from db import queries as q
+
+        if self.is_running(task_id):
+            logger.debug("Task %s still running; not retrying", task_id)
+            return False
+
+        await q.requeue_downloads(task_id, ("failed", "downloading"))
+        await q.update_task(task_id, status="pending", error_msg=None)
+        return await self.start_task(task_id, force=True)
+
+    async def shutdown(self) -> None:
+        """Pause and cancel everything. Called on application shutdown."""
+        snapshot = list(self._running_tasks.items())
+        for task_id, _ in snapshot:
+            event = self._pause_events.get(task_id)
+            if event is not None:
+                event.clear()
+            engine = self._engines.get(task_id)
+            if engine is not None:
+                engine.cancel()
+
+        for _, runner in snapshot:
+            runner.cancel()
+        for _, runner in snapshot:
             try:
-                await t
-            except asyncio.CancelledError:
+                await runner
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+
         self._running_tasks.clear()
         self._pause_events.clear()
-        self._progress_callbacks.clear()
+        self._engines.clear()
+        self._listeners.clear()

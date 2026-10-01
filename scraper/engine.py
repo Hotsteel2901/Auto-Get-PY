@@ -1,624 +1,959 @@
+"""Scrape orchestration: crawl pages, discover media, download it.
+
+The engine runs in two phases.
+
+**Discovery** — a bounded pool of workers pulls URLs off a queue, fetches each
+page, extracts media URLs using every strategy in :mod:`scraper.extractor`,
+then feeds pagination, ``<a href>`` links, stylesheets and iframes back into the
+queue.  A single :class:`aiohttp.ClientSession` is shared for the whole task so
+cookies and connection reuse work exactly as they would in a browser, which is
+what makes cookie-gated and hotlink-protected sites downloadable.
+
+**Transfer** — discovered URLs become database rows, then a second worker pool
+downloads them concurrently with retries, resume support and playlist merging.
+
+Every discovered URL remembers the page that referenced it, so media requests
+carry the correct ``Referer`` (many CDNs reject requests without one).
+"""
+
+from __future__ import annotations
+
 import asyncio
-import json
+import hashlib
 import logging
 import random
-import shutil
 import time
-import aiohttp
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
-from scraper.extractor import (
-    extract_media_urls, MEDIA_EXTENSIONS,
-    find_next_page_url, extract_page_links, extract_iframe_urls,
-    extract_css_urls, extract_inline_base64_images,
-    find_meta_refresh_url, extract_noscript_template_urls,
-    detect_encoding, guess_extension_from_content_type,
-)
+from urllib.parse import urljoin, urlparse
+
+import aiohttp
+
 from scraper.decryptors import run_pipeline
 from scraper.downloader import Downloader
+from scraper.extractor import (
+    MEDIA_EXTENSIONS,
+    canonicalize_url,
+    decode_body,
+    extract_css_urls,
+    extract_iframe_urls,
+    extract_media_urls,
+    extract_noscript_template_urls,
+    extract_page_links,
+    find_meta_refresh_url,
+    find_next_page_url,
+)
 from scraper.site_crawler import discover_site
 
 logger = logging.getLogger(__name__)
 
-_BINARY_CONTENT_TYPES = {
+_BINARY_CONTENT_TYPES = frozenset({
     "application/octet-stream", "application/pdf", "application/zip",
-    "application/x-rar-compressed", "application/x-7z-compressed",
-    "application/x-tar", "application/gzip", "application/x-bzip2",
-    "application/x-xz", "application/msword",
+    "application/x-rar-compressed", "application/vnd.rar",
+    "application/x-7z-compressed", "application/x-tar", "application/gzip",
+    "application/x-bzip2", "application/x-xz", "application/msword",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.ms-powerpoint",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    "application/epub+zip",
-}
+    "application/epub+zip", "application/vnd.apple.mpegurl", "application/x-mpegurl",
+    "application/dash+xml", "font/woff", "font/woff2", "font/ttf", "font/otf",
+    "application/font-woff", "application/font-woff2",
+})
 _BINARY_CONTENT_PREFIXES = ("video/", "audio/", "image/", "font/")
 
-# ── User-Agent rotation pool ────────────────────────────────────────────────
-
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+# Rotation pool used when the caller has not pinned a User-Agent.
+_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
-]
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+)
+
+DEFAULT_HEADERS = {
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+               "image/webp,image/apng,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
 
 
-def _get_ua(config: dict) -> str:
-    """Get User-Agent: use custom if set, else random from pool."""
-    custom_ua = config.get("custom_headers", {}).get("User-Agent")
-    if custom_ua:
-        return custom_ua
-    return random.choice(_USER_AGENTS)
+def build_headers(config: dict | "CrawlConfig", referer: str | None = None) -> dict:
+    """Compose request headers: caller overrides, then UA, then defaults.
 
+    Accepts either a raw config dict or a :class:`CrawlConfig`, because both
+    shapes reach this function.
+    """
+    if isinstance(config, CrawlConfig):
+        custom = dict(config.custom_headers)
+    else:
+        custom = dict(config.get("custom_headers") or {})
 
-def _build_headers(config: dict, referer: str = None) -> dict:
-    """Build request headers with UA rotation and optional referer."""
-    headers = config.get("custom_headers", {}).copy()
-    if "User-Agent" not in headers:
-        headers["User-Agent"] = _get_ua(headers)
+    headers = dict(DEFAULT_HEADERS)
+    headers.update(custom)
+    if not any(key.lower() == "user-agent" for key in headers):
+        headers["User-Agent"] = random.choice(_USER_AGENTS)
     if referer:
         headers.setdefault("Referer", referer)
-    headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-    headers.setdefault("Accept-Language", "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7")
     return headers
 
 
-def _check_disk_space(path: str, min_mb: int = 100) -> bool:
-    """Check if there's enough disk space."""
-    try:
-        usage = shutil.disk_usage(path)
-        free_mb = usage.free / (1024 * 1024)
-        return free_mb > min_mb
-    except Exception:
-        return True  # can't check, assume OK
+@dataclass
+class CrawlConfig:
+    """Validated task configuration with sensible defaults everywhere."""
+
+    start_url: str
+    output_dir: str = "./downloads"
+    concurrency: int = 5
+    crawl_concurrency: int = 8
+    request_delay_sec: float = 0.5
+    request_timeout_sec: int = 30
+    max_retries: int = 3
+    max_file_size_mb: int | None = 500
+    proxy: str | None = None
+    crawl_depth: int = 0
+    max_pages: int = 500
+    max_media: int = 20000
+    max_links_per_page: int = 20
+    follow_links: bool = False
+    follow_pagination: bool = True
+    crawl_css: bool = True
+    crawl_iframes: bool = True
+    use_browser: bool = False
+    site_discovery: bool = False
+    extract_base64: bool = False
+    probe_links: bool = False
+    scroll_page: bool = True
+    max_scrolls: int = 30
+    scroll_delay: float = 1.5
+    allowed_paths: list[str] = field(default_factory=list)
+    include_filters: list[str] = field(default_factory=list)
+    exclude_filters: list[str] = field(default_factory=list)
+    decryptors: list[str] = field(default_factory=list)
+    decryptor_opts: dict = field(default_factory=dict)
+    custom_headers: dict = field(default_factory=dict)
+    time_budget_sec: float = 0.0
+
+    @classmethod
+    def from_dict(cls, url: str, config: dict | None) -> "CrawlConfig":
+        raw = dict(config or {})
+        filters = raw.get("url_filters") or {}
+
+        def _int(key, default, low=0, high=None):
+            try:
+                value = int(raw.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            value = max(low, value)
+            return min(high, value) if high is not None else value
+
+        def _float(key, default, low=0.0):
+            try:
+                value = float(raw.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(low, value)
+
+        max_size = raw.get("max_file_size_mb", 500)
+        try:
+            max_size = int(max_size)
+        except (TypeError, ValueError):
+            max_size = 500
+
+        return cls(
+            start_url=url,
+            output_dir=str(raw.get("output_dir") or "./downloads"),
+            concurrency=_int("concurrency", 5, 1, 50),
+            crawl_concurrency=_int("crawl_concurrency", 8, 1, 32),
+            request_delay_sec=_float("request_delay_sec", 0.5),
+            request_timeout_sec=_int("request_timeout_sec", 30, 3, 600),
+            max_retries=_int("max_retries", 3, 0, 10),
+            max_file_size_mb=max_size if max_size > 0 else None,
+            proxy=raw.get("proxy") or None,
+            crawl_depth=_int("crawl_depth", 0, 0, 50),
+            max_pages=_int("max_pages", 500, 1, 500000),
+            max_media=_int("max_media", 20000, 1, 500000),
+            max_links_per_page=_int("max_links_per_page", 20, 1, 500),
+            follow_links=bool(raw.get("follow_links", False)),
+            follow_pagination=bool(raw.get("follow_pagination", True)),
+            crawl_css=bool(raw.get("crawl_css", True)),
+            crawl_iframes=bool(raw.get("crawl_iframes", True)),
+            use_browser=bool(raw.get("use_browser", False)),
+            site_discovery=bool(raw.get("site_discovery", False)),
+            extract_base64=bool(raw.get("extract_base64", False)),
+            probe_links=bool(raw.get("probe_links", False)),
+            scroll_page=bool(raw.get("scroll_page", True)),
+            max_scrolls=_int("max_scrolls", 30, 0, 500),
+            scroll_delay=_float("scroll_delay", 1.5, 0.0),
+            allowed_paths=list(raw.get("allowed_paths") or []),
+            include_filters=list(filters.get("include") or []),
+            exclude_filters=list(filters.get("exclude") or []),
+            decryptors=list(raw.get("decryptors") or []),
+            decryptor_opts=dict(raw.get("decryptor_opts") or {}),
+            custom_headers=dict(raw.get("custom_headers") or {}),
+            time_budget_sec=_float("time_budget_sec", 0.0),
+        )
 
 
 class ScraperEngine:
+    """Runs one task: discovery followed by transfer."""
+
     def __init__(self, task_id: int, semaphore: asyncio.Semaphore,
-                 pause_event: asyncio.Event, progress_cb=None):
+                 pause_event: asyncio.Event, progress_cb=None,
+                 file_progress_cb=None):
         self.task_id = task_id
-        self._semaphore = semaphore
+        self._global_sem = semaphore
         self._pause_event = pause_event
         self._progress_cb = progress_cb
-        self._downloader = Downloader()
-        self._visited_pages: set[str] = set()
-        self._all_media_urls: set[str] = set()
-        self._css_files_crawled: set[str] = set()
-        self._cookie_jar: dict = {}  # domain -> cookies
+        self._file_progress_cb = file_progress_cb
 
-    # ── Download with retry + 429 handling ──
+        self.session: aiohttp.ClientSession | None = None
+        self._downloader: Downloader | None = None
 
-    async def _download_item(self, dl, output_dir, headers, timeout, max_retries,
-                             request_delay, proxy=None, max_file_size_mb=None):
-        from db import queries as q
+        # url -> the page that referenced it (used as Referer)
+        self._media: dict[str, str | None] = {}
+        self._visited: set[str] = set()
+        self._css_seen: set[str] = set()
+        self._probed: set[str] = set()
+        self._pages_fetched = 0
+        self._cancelled = False
 
-        async with self._semaphore:
-            await self._pause_event.wait()
-            await asyncio.sleep(request_delay)
+        # Transfer bookkeeping
+        self._done_count = 0
+        self._total_count = 0
+        self._started_at = time.monotonic()
+        self._progress_lock = asyncio.Lock()
 
-            retries = 0
-            while True:
-                await q.update_download(dl["id"], status="downloading")
+        # Discovery limits, filled in from the task config by `run()`.
+        self._include_filters: list[str] = []
+        self._exclude_filters: list[str] = []
+        self._max_media = 100000
 
-                try:
-                    resume_from = Path(output_dir, dl["filename"]).stat().st_size
-                except FileNotFoundError:
-                    resume_from = 0
+    # ── Public entry point ──────────────────────────────────────────────────
 
-                # Disk space check before each download
-                if not _check_disk_space(output_dir):
-                    return {"status": "failed", "error_msg": "Disk space critically low"}
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._pause_event.set()
 
-                # Rotate UA per request
-                req_headers = _build_headers({"custom_headers": headers})
+    def _bind_config(self, config: CrawlConfig) -> None:
+        """Copy the discovery limits the registry and filters depend on."""
+        self._include_filters = config.include_filters
+        self._exclude_filters = config.exclude_filters
+        self._max_media = config.max_media
 
-                dl_result = await self._downloader.download_file(
-                    url=dl["url"],
-                    output_dir=output_dir,
-                    filename=dl["filename"],
-                    task_id=self.task_id,
-                    dl_id=dl["id"],
-                    progress_callback=self._on_progress,
-                    headers=req_headers,
-                    timeout=timeout,
-                    resume_from=resume_from,
-                    proxy=proxy,
-                    max_file_size_mb=max_file_size_mb,
-                )
+    @property
+    def discovered_urls(self) -> list[str]:
+        """Media URLs found so far, in discovery order."""
+        return list(self._media.keys())
 
-                if dl_result["status"] == "completed":
-                    await q.update_download(dl["id"], status="completed",
-                                            file_size=dl_result["file_size"])
-                    return dl_result
+    @property
+    def pages_fetched(self) -> int:
+        return self._pages_fetched
 
-                # Handle 429 Too Many Requests with smart backoff
-                error_msg = dl_result.get("error_msg", "")
-                if "429" in error_msg:
-                    wait = 30 + random.uniform(5, 15)
-                    logger.warning("Rate limited (429) on %s, waiting %.0fs", dl["url"], wait)
-                    await asyncio.sleep(wait)
-                    retries += 1
-                else:
-                    retries += 1
+    async def discover(self, config: CrawlConfig) -> None:
+        """Run only the discovery phase, writing nothing to disk.
 
-                if retries < max_retries:
-                    backoff = min(2 ** retries, 60) + random.uniform(0, 2)
-                    await q.update_download(dl["id"], status="pending",
-                                            retry_count=retries,
-                                            error_msg=error_msg)
-                    await asyncio.sleep(backoff)
-                else:
-                    await q.update_download(dl["id"], status="failed",
-                                            error_msg=error_msg)
-                    return dl_result
-
-    # ── Page fetching with retry + anti-crawl ──
-
-    async def _fetch_page(self, url: str, headers: dict, timeout: int,
-                          proxy: str = None) -> tuple[str | None, bool, str | None]:
-        """Fetch a page. Returns (html, is_direct_file, error)."""
-        for attempt in range(3):
-            try:
-                # Rotate UA on each attempt
-                actual_headers = headers.copy() if headers else {}
-                if "User-Agent" not in actual_headers:
-                    actual_headers["User-Agent"] = _get_ua({})
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        url, headers=actual_headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout),
-                        proxy=proxy,
-                        allow_redirects=True,
-                    ) as resp:
-                        if resp.status == 429:
-                            wait = 30 + random.uniform(5, 15)
-                            logger.warning("429 on %s, waiting %.0fs", url, wait)
-                            await asyncio.sleep(wait)
-                            continue
-
-                        if resp.status == 403:
-                            # Try with different UA
-                            actual_headers["User-Agent"] = random.choice(_USER_AGENTS)
-                            continue
-
-                        if resp.status not in (200, 301, 302):
-                            return (None, False, f"HTTP {resp.status}")
-
-                        content_type = resp.headers.get('Content-Type', '').lower()
-                        content_disposition = resp.headers.get('Content-Disposition', '')
-                        parsed_path = urlparse(url).path.lower()
-
-                        is_file = (
-                            any(ct in content_type for ct in _BINARY_CONTENT_TYPES) or
-                            any(content_type.startswith(prefix) for prefix in _BINARY_CONTENT_PREFIXES) or
-                            'attachment' in content_disposition or
-                            any(parsed_path.endswith(ext) for ext in MEDIA_EXTENSIONS)
-                        )
-                        if is_file:
-                            return (None, True, None)
-
-                        # Detect encoding properly (supports Chinese sites)
-                        raw_body = await resp.read()
-                        encoding = detect_encoding(dict(resp.headers), raw_body)
-                        try:
-                            text = raw_body.decode(encoding, errors='replace')
-                        except (LookupError, UnicodeDecodeError):
-                            text = raw_body.decode('utf-8', errors='replace')
-                        return (text, False, None)
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                logger.warning("Failed to fetch %s: %s", url, e)
-                return (None, False, str(e))
-
-    # ── CSS file crawling ──
-
-    async def _crawl_css_file(self, css_url: str, config: dict,
-                               headers: dict, timeout: int, proxy: str = None):
-        """Fetch a CSS file and extract media URLs + nested @import CSS."""
-        if css_url in self._css_files_crawled:
-            return
-        self._css_files_crawled.add(css_url)
-
+        Used by the preview endpoints, which must honour the same URL filters
+        and budgets as a real run.
+        """
+        self._bind_config(config)
+        self._downloader = Downloader(config.output_dir)
+        self.session = Downloader.create_session()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    css_url, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout),
-                    proxy=proxy,
-                ) as resp:
-                    if resp.status != 200:
-                        return
-                    ct = resp.headers.get('content-type', '').lower()
-                    if 'css' not in ct and 'text' not in ct:
-                        return
-                    css_text = await resp.text()
-        except Exception:
-            return
+            await self._discovery_phase(config)
+            self._register_failed_start_url(config)
+        finally:
+            await self.session.close()
+            self.session = None
 
-        media_urls, import_urls = extract_css_urls(css_text, css_url)
-        include_filters = config.get("url_filters", {}).get("include")
-        exclude_filters = config.get("url_filters", {}).get("exclude")
-
-        for url in media_urls:
-            if include_filters and not any(
-                fnmatch(urlparse(url).path.lower(), f.lower()) for f in include_filters
-            ):
-                continue
-            if exclude_filters and any(
-                fnmatch(urlparse(url).path.lower(), f.lower()) for f in exclude_filters
-            ):
-                continue
-            self._all_media_urls.add(url)
-
-        # Recurse into @import CSS files
-        for import_url in import_urls[:5]:  # limit depth
-            await self._crawl_css_file(import_url, config, headers, timeout, proxy)
-
-    # ── Core crawl logic ──
-
-    async def _crawl_page(self, url: str, config: dict, depth: int,
-                          headers: dict, timeout: int, proxy: str = None) -> None:
-        """Recursively crawl a page: extract media URLs + follow links/pages."""
-        if url in self._visited_pages:
-            return
-        if depth > config.get("crawl_depth", 0):
-            return
-        if len(self._all_media_urls) >= config.get("max_pages", 200):
-            return
-
-        self._visited_pages.add(url)
-        logger.info("[Crawl depth=%d] Fetching %s", depth, url)
-
-        # Build headers with referer chain
-        req_headers = _build_headers(config, referer=url if depth > 0 else None)
-
-        page_html, is_direct_file, fetch_error = await self._fetch_page(
-            url, req_headers, timeout, proxy)
-
-        if is_direct_file:
-            self._all_media_urls.add(url)
-            return
-
-        if page_html is None:
-            logger.warning("Skipping %s: %s", url, fetch_error)
-            return
-
-        # Decryptors
-        decryptors_enabled = config.get("decryptors", [])
-        decryptor_opts = config.get("decryptor_opts", {})
-        if decryptors_enabled and page_html:
-            result = await run_pipeline(
-                page_html.encode("utf-8"),
-                decryptors_enabled,
-                decryptor_opts,
-                max_passes=3,
-            )
-            page_html = result.data.decode("utf-8", errors="ignore")
-
-        # Extract media URLs
-        include_filters = config.get("url_filters", {}).get("include")
-        exclude_filters = config.get("url_filters", {}).get("exclude")
-        media_urls = extract_media_urls(page_html, url, include_filters, exclude_filters)
-        self._all_media_urls.update(media_urls)
-
-        # Also extract from <noscript> and <template> tags (Pinterest/Instagram pattern)
-        ns_urls = extract_noscript_template_urls(page_html, url)
-        if ns_urls:
-            self._all_media_urls.update(ns_urls)
-            logger.info("[depth=%d] Found %d noscript/template URLs", depth, len(ns_urls))
-
-        # Follow meta refresh redirects
-        refresh_url = find_meta_refresh_url(page_html, url)
-        if refresh_url and refresh_url not in self._visited_pages:
-            logger.info("[depth=%d] Following meta refresh → %s", depth, refresh_url)
-            await self._crawl_page(refresh_url, config, depth, req_headers, timeout, proxy)
-
-        # Crawl linked CSS files for hidden URLs
-        if config.get("crawl_css", True):
-            from scraper.extractor import CSS_IMPORT_PATTERN
-            for match in re.finditer(r'(?i)href\s*=\s*["\']([^"\']+\.css[^"\']*)["\']', page_html):
-                css_url = match.group(1)
-                if not css_url.startswith('http'):
-                    css_url = urljoin(url, css_url)
-                if css_url not in self._css_files_crawled:
-                    await self._crawl_css_file(css_url, config, req_headers, timeout, proxy)
-
-        # Crawl iframes
-        if config.get("crawl_iframes", True):
-            iframe_urls = extract_iframe_urls(page_html, url)
-            for iframe_url in iframe_urls[:5]:
-                if iframe_url not in self._visited_pages:
-                    await self._crawl_page(iframe_url, config, depth + 1,
-                                           req_headers, timeout, proxy)
-
-        logger.info("[depth=%d] Found %d media URLs on %s (total: %d)",
-                     depth, len(media_urls), url, len(self._all_media_urls))
-
-        # Discover more pages
-        if depth < config.get("crawl_depth", 0) and len(self._all_media_urls) < config.get("max_pages", 200):
-            follow_tasks = []
-
-            # Auto-pagination
-            if config.get("follow_pagination", True):
-                next_url = find_next_page_url(page_html, url)
-                if next_url and next_url not in self._visited_pages:
-                    follow_tasks.append(
-                        self._crawl_page(next_url, config, depth + 1, req_headers, timeout, proxy)
-                    )
-
-            # Link following
-            if config.get("follow_links", False):
-                allowed_paths = config.get("allowed_paths", None)
-                page_links = extract_page_links(
-                    page_html, url, same_domain=True, allowed_paths=allowed_paths)
-                max_links = config.get("max_links_per_page", 10)
-                for link in page_links[:max_links]:
-                    if link not in self._visited_pages:
-                        follow_tasks.append(
-                            self._crawl_page(link, config, depth + 1, req_headers, timeout, proxy)
-                        )
-
-            if follow_tasks:
-                await asyncio.gather(*follow_tasks, return_exceptions=True)
-
-    # ── Browser-enhanced crawl ──
-
-    async def _crawl_with_browser(self, url: str, config: dict,
-                                   headers: dict, timeout: int,
-                                   proxy: str = None) -> None:
-        """Use Playwright to render JS-heavy pages and capture network media."""
-        try:
-            from scraper.browser import render_page
-        except RuntimeError as e:
-            logger.warning("Browser rendering unavailable: %s", e)
-            return
-
-        logger.info("[Browser] Rendering %s", url)
-        result = await render_page(
-            url, headers=headers, timeout=timeout, proxy=proxy,
-            scroll=config.get("scroll_page", True),
-            max_scrolls=config.get("max_scrolls", 30),
-            scroll_delay=config.get("scroll_delay", 1.5),
-        )
-
-        # Add network-captured media URLs
-        network_urls = result.get("network_urls", set())
-        self._all_media_urls.update(network_urls)
-        logger.info("[Browser] Captured %d network media URLs", len(network_urls))
-
-        # Also extract from rendered HTML
-        html = result.get("html", "")
-        if html:
-            include_filters = config.get("url_filters", {}).get("include")
-            exclude_filters = config.get("url_filters", {}).get("exclude")
-            media_urls = extract_media_urls(html, url, include_filters, exclude_filters)
-            self._all_media_urls.update(media_urls)
-
-            # Crawl links from rendered page too
-            if config.get("follow_links", False):
-                allowed_paths = config.get("allowed_paths", None)
-                page_links = extract_page_links(
-                    html, url, same_domain=True, allowed_paths=allowed_paths)
-                max_links = config.get("max_links_per_page", 10)
-                for link in page_links[:max_links]:
-                    if link not in self._visited_pages:
-                        self._visited_pages.add(link)
-                        # Render each linked page too
-                        link_result = await render_page(
-                            link, headers=headers, timeout=timeout, proxy=proxy,
-                            scroll=True, max_scrolls=10,
-                        )
-                        link_html = link_result.get("html", "")
-                        if link_html:
-                            link_media = extract_media_urls(
-                                link_html, link, include_filters, exclude_filters)
-                            self._all_media_urls.update(link_media)
-                        self._all_media_urls.update(link_result.get("network_urls", set()))
-
-    # ── Main run ──
-
-    async def run(self):
+    async def run(self) -> None:
         from db import queries as q
-        import re as _re  # for CSS href matching
 
         task = await q.get_task(self.task_id)
         if not task:
+            logger.warning("Task %s disappeared before it started", self.task_id)
             return
-        config = json.loads(task["config"]) if task["config"] else {}
-        concurrency = config.get("concurrency", 5)
-        request_delay = config.get("request_delay_sec", 0.5)
-        timeout = config.get("request_timeout_sec", 30)
-        max_retries = config.get("max_retries", 3)
-        output_dir = config.get("output_dir", "./downloads")
-        headers = _build_headers(config)
-        proxy = config.get("proxy", None)
-        max_file_size_mb = config.get("max_file_size_mb", None)
-        crawl_depth = config.get("crawl_depth", 0)
-        max_pages = config.get("max_pages", 200)
-        use_browser = config.get("use_browser", False)
-        use_site_discovery = config.get("site_discovery", False)
 
-        # Ensure output dir exists
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        config = CrawlConfig.from_dict(task["url"], task.get("config_parsed") or {})
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Phase 1: Site discovery (sitemap, robots, feeds) ──
-        if use_site_discovery:
-            logger.info("Starting site discovery for %s", task["url"])
-            discovery = await discover_site(
-                task["url"], headers=headers, timeout=timeout, proxy=proxy)
-            # Add all discovered media URLs from feeds
-            self._all_media_urls.update(discovery.get("feed_media_urls", []))
-            # Add sitemap URLs and feed page URLs to the crawl queue
-            sitemap_pages = discovery.get("sitemap_urls", [])
-            feed_pages = discovery.get("feed_page_urls", [])
-            all_discovered_pages = sitemap_pages + feed_pages
-            logger.info("Site discovery found %d pages to crawl", len(all_discovered_pages))
+        self._bind_config(config)
+        self._downloader = Downloader(str(output_dir))
+        self.session = Downloader.create_session()
 
-            # Crawl discovered pages
-            include_filters = config.get("url_filters", {}).get("include")
-            exclude_filters = config.get("url_filters", {}).get("exclude")
+        started = time.monotonic()
+        try:
+            await self._discovery_phase(config)
+            self._register_failed_start_url(config)
+            await self._transfer_phase(config)
+        finally:
+            await self.session.close()
+            self.session = None
 
-            for page_url in all_discovered_pages[:max_pages]:
-                if page_url in self._visited_pages:
-                    continue
-                if len(self._all_media_urls) >= max_pages:
-                    break
-                self._visited_pages.add(page_url)
+        elapsed = time.monotonic() - started
+        logger.info("[Task %d] finished in %.1fs (%d pages, %d media)",
+                    self.task_id, elapsed, self._pages_fetched, len(self._media))
 
-                # Check if it's a direct media file
-                parsed_path = urlparse(page_url).path.lower()
-                if any(parsed_path.endswith(ext) for ext in MEDIA_EXTENSIONS):
-                    self._all_media_urls.add(page_url)
-                    continue
+    # ── Phase 1: discovery ──────────────────────────────────────────────────
 
-                if use_browser:
-                    await self._crawl_with_browser(
-                        page_url, config, headers, timeout, proxy)
-                else:
-                    await self._crawl_page(
-                        page_url, config, depth=0, headers=headers,
-                        timeout=timeout, proxy=proxy)
-
-            logger.info("After site discovery crawl: %d media URLs found",
-                        len(self._all_media_urls))
-
-        # ── Phase 2: Crawl starting URL ──
-        use_crawling = (
-            crawl_depth > 0
-            or config.get("follow_links", False)
-            or config.get("follow_pagination", True)
-            or use_site_discovery
-        )
-
-        if use_browser and not use_site_discovery:
-            # Browser mode for JS-heavy sites
-            await self._crawl_with_browser(
-                task["url"], config, headers, timeout, proxy)
-            all_urls = list(self._all_media_urls)
-        elif use_crawling and not use_site_discovery:
-            # Standard multi-page crawl
-            await self._crawl_page(
-                task["url"], config, depth=0, headers=headers,
-                timeout=timeout, proxy=proxy)
-            all_urls = list(self._all_media_urls)
+    async def _discovery_phase(self, config: CrawlConfig) -> None:
+        if config.crawl_css or config.crawl_iframes or config.follow_links \
+                or config.follow_pagination or config.crawl_depth > 0 \
+                or config.use_browser or config.site_discovery:
+            await self._crawl(config)
         else:
-            # Single page or already crawled via site_discovery
-            if not self._all_media_urls:
-                page_html, is_direct_file, fetch_error = await self._fetch_page(
-                    task["url"], headers, timeout, proxy)
-                if is_direct_file:
-                    all_urls = [task["url"]]
-                elif page_html is None:
-                    await q.update_task(self.task_id, status="failed",
-                                        error_msg=fetch_error or "Failed to fetch page")
-                    return
-                else:
-                    decryptors_enabled = config.get("decryptors", [])
-                    decryptor_opts = config.get("decryptor_opts", {})
-                    if decryptors_enabled and page_html:
-                        result = await run_pipeline(
-                            page_html.encode("utf-8"), decryptors_enabled,
-                            decryptor_opts, max_passes=3)
-                        page_html = result.data.decode("utf-8", errors="ignore")
+            await self._single_page(config)
 
-                    include_filters = config.get("url_filters", {}).get("include")
-                    exclude_filters = config.get("url_filters", {}).get("exclude")
-                    all_urls = extract_media_urls(
-                        page_html, task["url"], include_filters, exclude_filters)
-            else:
-                all_urls = list(self._all_media_urls)
+    def _register_failed_start_url(self, config: CrawlConfig) -> None:
+        """If the target itself is a media file that would not load, keep it.
 
-        # ── Phase 3: Extract inline base64 images ──
-        if config.get("extract_base64", False) and page_html:
-            b64_results = extract_inline_base64_images(page_html, output_dir)
-            if b64_results:
-                logger.info("Extracted %d inline base64 images", len(b64_results))
+        Otherwise a mistyped or protected file URL produces an empty, silent
+        task instead of a download record explaining what went wrong.
+        """
+        if self._media or self._cancelled:
+            return
+        parsed = urlparse(config.start_url)
+        if any(parsed.path.lower().endswith(ext) for ext in MEDIA_EXTENSIONS):
+            self._register_media([config.start_url], None)
 
-        # ── Phase 4: Deduplicate URLs ──
-        # Normalize and deduplicate
-        seen_normalized = set()
-        unique_urls = []
-        for url in all_urls:
-            # Normalize: remove trailing slash, lowercase domain, strip tracking params
-            parsed = urlparse(url)
-            normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip('/')
-            if normalized not in seen_normalized:
-                seen_normalized.add(normalized)
-                unique_urls.append(url)
-        all_urls = unique_urls
+    async def _single_page(self, config: CrawlConfig) -> None:
+        """Fetch exactly one URL and extract from it."""
+        html, final_url, error = await self._fetch(config, config.start_url, None)
+        if error:
+            from db import queries as q
 
-        logger.info("Total unique media URLs to download: %d (crawled %d pages)",
-                    len(all_urls), len(self._visited_pages))
-
-        # ── Phase 5: Create download records ──
-        if not all_urls:
-            await q.update_task(self.task_id, status="completed", total_files=0, done_files=0)
+            await q.update_task(self.task_id, status="failed",
+                                error_msg=f"Failed to fetch page: {error}")
             return
 
-        existing_urls = await q.get_existing_download_urls(self.task_id)
-        new_urls = [url for url in all_urls if url not in existing_urls]
-        for url in new_urls:
-            filename = Downloader.extract_filename(url)
-            await q.create_download(self.task_id, url, filename)
+        if final_url in self._media:
+            return  # it was a direct media file
+
+        self._pages_fetched = 1
+        page_url = final_url or config.start_url
+        html = await self._apply_decryptors(html, config)
+
+        media = extract_media_urls(html, page_url,
+                                   config.include_filters, config.exclude_filters)
+        self._register_media(media, page_url)
+        self._register_media(extract_noscript_template_urls(html, page_url), page_url)
+
+        if config.extract_base64:
+            from scraper.extractor import extract_inline_base64_images
+
+            saved = extract_inline_base64_images(html, config.output_dir)
+            if saved:
+                logger.info("[Task %d] extracted %d inline base64 images",
+                            self.task_id, len(saved))
+
+    async def _crawl(self, config: CrawlConfig) -> None:
+        """Bounded, concurrent crawl starting from ``config.start_url``."""
+        queue: asyncio.Queue = asyncio.Queue()
+        await queue.put((config.start_url, 0, None))
+        self._pages_fetched = 0
+
+        if config.site_discovery:
+            await self._seed_from_site_discovery(config, queue)
+
+        workers = [
+            asyncio.create_task(self._crawl_worker(queue, config))
+            for _ in range(config.crawl_concurrency)
+        ]
+        try:
+            await queue.join()
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        logger.info("[Task %d] discovery done: %d pages, %d media URLs",
+                    self.task_id, self._pages_fetched, len(self._media))
+
+    async def _seed_from_site_discovery(self, config: CrawlConfig,
+                                        queue: asyncio.Queue) -> None:
+        """Feed sitemap and feed URLs into the crawl queue."""
+        try:
+            discovery = await discover_site(
+                config.start_url, headers=build_headers(config),
+                timeout=config.request_timeout_sec, proxy=config.proxy)
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            logger.warning("[Task %d] site discovery failed: %s", self.task_id, exc)
+            return
+
+        self._register_media(discovery.get("feed_media_urls") or [], None)
+        pages = (discovery.get("sitemap_urls") or []) + (discovery.get("feed_page_urls") or [])
+        logger.info("[Task %d] site discovery found %d pages", self.task_id, len(pages))
+
+        for page_url in pages:
+            if self._pages_fetched >= config.max_pages:
+                break
+            parsed = urlparse(page_url)
+            if any(parsed.path.lower().endswith(ext) for ext in MEDIA_EXTENSIONS):
+                self._register_media([page_url], None)
+                continue
+            if canonicalize_url(page_url) in self._visited:
+                continue
+            await queue.put((page_url, 0, None))
+
+    async def _crawl_worker(self, queue: asyncio.Queue, config: CrawlConfig) -> None:
+        while True:
+            url, depth, referer = await queue.get()
+            try:
+                if self._cancelled:
+                    continue
+                if not self._claim(url, depth, config):
+                    continue
+                await self._pause_event.wait()
+                if self._cancelled:
+                    continue
+                await self._visit(url, depth, referer, config, queue)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad page must not kill the crawl
+                logger.exception("[Task %d] crawl error on %s", self.task_id, url)
+            finally:
+                queue.task_done()
+
+    def _claim(self, url: str, depth: int, config: CrawlConfig) -> bool:
+        """Reserve the right to crawl ``url``; False when out of budget."""
+        if self._cancelled:
+            return False
+        if depth > config.crawl_depth:
+            return False
+        if self._pages_fetched >= config.max_pages:
+            return False
+        if len(self._media) >= config.max_media:
+            return False
+        key = canonicalize_url(url)
+        if key in self._visited:
+            return False
+        self._visited.add(key)
+        self._pages_fetched += 1
+        return True
+
+    async def _visit(self, url: str, depth: int, referer: str | None,
+                     config: CrawlConfig, queue: asyncio.Queue) -> None:
+        if config.request_delay_sec:
+            await asyncio.sleep(config.request_delay_sec)
+
+        if config.use_browser:
+            handled = await self._visit_with_browser(url, depth, config, queue)
+            if handled:
+                return
+
+        html, final_url, error = await self._fetch(config, url, referer)
+        if error:
+            logger.debug("[Task %d] skip %s: %s", self.task_id, url, error)
+            return
+        if html is None:
+            return  # direct media file, already registered
+
+        page_url = final_url or url
+        html = await self._apply_decryptors(html, config)
+
+        found = extract_media_urls(html, page_url,
+                                   config.include_filters, config.exclude_filters)
+        found += extract_noscript_template_urls(html, page_url)
+        self._register_media(found, page_url)
+
+        if config.extract_base64:
+            from scraper.extractor import extract_inline_base64_images
+
+            extract_inline_base64_images(html, config.output_dir)
+
+        if self._cancelled or len(self._media) >= config.max_media:
+            return
+
+        # ── Follow a meta-refresh redirect ──
+        refresh = find_meta_refresh_url(html, page_url)
+        if refresh:
+            await queue.put((refresh, depth, page_url))
+
+        # ── Feed child URLs back into the queue ──
+        if self._pages_fetched >= config.max_pages:
+            return
+
+        if config.crawl_css:
+            for css_url in self._stylesheet_urls(html, page_url):
+                await self._crawl_stylesheet(css_url, config, page_url, depth, queue)
+
+        if config.crawl_iframes:
+            for iframe_url in extract_iframe_urls(html, page_url)[:5]:
+                await queue.put((iframe_url, depth + 1, page_url))
+
+        # Pagination is a sibling chain: it does not consume crawl depth.
+        if config.follow_pagination:
+            next_url = find_next_page_url(html, page_url, self._visited)
+            if next_url:
+                logger.debug("[Task %d] pagination → %s", self.task_id, next_url)
+                await queue.put((next_url, depth, page_url))
+
+        if config.follow_links and depth < config.crawl_depth:
+            links = extract_page_links(
+                html, page_url, same_domain=True,
+                allowed_paths=config.allowed_paths or None,
+                max_links=config.max_links_per_page)
+            for link in links:
+                await queue.put((link, depth + 1, page_url))
+
+    def _stylesheet_urls(self, html: str, base_url: str) -> list[str]:
+        import re
+
+        urls: list[str] = []
+        for match in re.finditer(r'(?i)<link\s+[^>]*?href\s*=\s*["\']([^"\']+\.css[^"\']*)["\']',
+                                 html):
+            resolved = urljoin(base_url, match.group(1))
+            if resolved not in self._css_seen:
+                urls.append(resolved)
+        return urls
+
+    async def _crawl_stylesheet(self, css_url: str, config: CrawlConfig,
+                                referer: str, depth: int, queue: asyncio.Queue,
+                                _level: int = 0) -> None:
+        """Fetch a stylesheet and harvest the assets it references."""
+        if css_url in self._css_seen or _level > 3 or self._cancelled:
+            return
+        if len(self._media) >= config.max_media:
+            return
+        self._css_seen.add(css_url)
+
+        headers = build_headers(config, referer)
+        try:
+            async with self.session.get(
+                css_url, headers=headers, allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=config.request_timeout_sec),
+            ) as resp:
+                if resp.status != 200:
+                    return
+                content_type = resp.headers.get("Content-Type", "").lower()
+                if "css" not in content_type and "text" not in content_type:
+                    return
+                css_text = (await resp.read()).decode("utf-8", errors="replace")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return
+
+        media_urls, imports = extract_css_urls(css_text, css_url)
+        self._register_media(media_urls, css_url)
+
+        for import_url in imports[:10]:
+            await self._crawl_stylesheet(import_url, config, referer, depth, queue,
+                                         _level + 1)
+
+    async def _visit_with_browser(self, url: str, depth: int, config: CrawlConfig,
+                                  queue: asyncio.Queue) -> bool:
+        """Render with Playwright and harvest both DOM and network traffic."""
+        try:
+            from scraper.browser import render_page
+        except ImportError as exc:
+            logger.warning("[Task %d] browser rendering unavailable: %s", self.task_id, exc)
+            return False
+
+        result = await render_page(
+            url, headers=build_headers(config), timeout=config.request_timeout_sec,
+            proxy=config.proxy, scroll=config.scroll_page,
+            max_scrolls=config.max_scrolls, scroll_delay=config.scroll_delay)
+
+        self._adopt_browser_cookies(result.get("cookies") or [])
+
+        network_urls = result.get("network_urls") or set()
+        self._register_media(network_urls, url)
+
+        html = result.get("html") or ""
+        if html:
+            found = extract_media_urls(html, url, config.include_filters,
+                                       config.exclude_filters)
+            self._register_media(found, url)
+
+            if config.follow_links and depth < config.crawl_depth:
+                for link in extract_page_links(
+                        html, url, same_domain=True,
+                        allowed_paths=config.allowed_paths or None,
+                        max_links=config.max_links_per_page):
+                    await queue.put((link, depth + 1, url))
+            if config.follow_pagination:
+                next_url = find_next_page_url(html, url, self._visited)
+                if next_url:
+                    await queue.put((next_url, depth, url))
+            return True
+
+        if result.get("error"):
+            # Rendering failed: let the plain HTTP path have a go.
+            return False
+        return True
+
+    def _adopt_browser_cookies(self, cookies: list[dict]) -> None:
+        """Copy browser cookies into the shared jar so downloads can use them."""
+        if not self.session or not cookies:
+            return
+        jar = self.session.cookie_jar
+        for cookie in cookies:
+            name, value = cookie.get("name"), cookie.get("value")
+            if not name or value is None:
+                continue
+            domain = (cookie.get("domain") or "").lstrip(".") or "localhost"
+            path = cookie.get("path") or "/"
+            scheme = "https" if cookie.get("secure") else "http"
+            try:
+                jar.update_cookies(
+                    {name: value},
+                    response_url=aiohttp.client.URL(f"{scheme}://{domain}{path}"),
+                )
+            except Exception:  # noqa: BLE001 - cookie shapes vary wildly
+                continue
+
+    # ── Fetching ────────────────────────────────────────────────────────────
+
+    async def _fetch(self, config: CrawlConfig, url: str,
+                     referer: str | None) -> tuple[str | None, str | None, str | None]:
+        """Fetch a URL.
+
+        Returns ``(html, final_url, error)``.  When the target turns out to be a
+        media file, ``html`` is ``None``, the URL is registered, and there is no
+        error.
+        """
+        attempts = max(1, config.max_retries + 1)
+        last_error: str | None = None
+
+        for attempt in range(attempts):
+            if self._cancelled:
+                return None, None, "cancelled"
+            headers = build_headers(config, referer)
+            try:
+                async with self.session.get(
+                    url, headers=headers, allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=config.request_timeout_sec),
+                ) as resp:
+                    final_url = str(resp.url)
+
+                    if resp.status == 429:
+                        wait = _retry_after(resp)
+                        logger.warning("[Task %d] 429 on %s, waiting %ss",
+                                       self.task_id, url, wait)
+                        await asyncio.sleep(min(wait, 120))
+                        last_error = "HTTP 429"
+                        continue
+
+                    if resp.status in (403, 401):
+                        # Rotate the UA and pretend to arrive from search.
+                        last_error = f"HTTP {resp.status}"
+                        if attempt + 1 < attempts:
+                            await asyncio.sleep(1 + attempt)
+                        continue
+
+                    if resp.status >= 400:
+                        return None, None, f"HTTP {resp.status}"
+
+                    content_type = (resp.headers.get("Content-Type") or "").lower()
+                    disposition = resp.headers.get("Content-Disposition") or ""
+                    if self._looks_like_file(final_url, content_type, disposition):
+                        # Goes through _register_media so url_filters apply here
+                        # too, not just to what the HTML parser found.
+                        self._register_media([final_url], referer)
+                        return None, final_url, None
+
+                    body = await resp.read()
+                    html, _ = decode_body(body, dict(resp.headers))
+                    return html, final_url, None
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = str(exc) or type(exc).__name__
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[Task %d] fetch failed for %s", self.task_id, url)
+                return None, None, str(exc)
+
+        return None, None, last_error or "unknown error"
+
+    @staticmethod
+    def _looks_like_file(url: str, content_type: str, disposition: str) -> bool:
+        if "attachment" in disposition.lower():
+            return True
+        mime = content_type.split(";")[0].strip()
+        if mime in _BINARY_CONTENT_TYPES:
+            return True
+        if any(mime.startswith(prefix) for prefix in _BINARY_CONTENT_PREFIXES):
+            return True
+        path = urlparse(url).path.lower()
+        return any(path.endswith(ext) for ext in MEDIA_EXTENSIONS)
+
+    async def _apply_decryptors(self, html: str, config: CrawlConfig) -> str:
+        if not html or not config.decryptors:
+            return html
+        try:
+            result = await run_pipeline(
+                html.encode("utf-8", errors="replace"), config.decryptors,
+                config.decryptor_opts, max_passes=3)
+        except Exception as exc:  # noqa: BLE001 - decryptors are user-provided
+            logger.warning("[Task %d] decryptor pipeline failed: %s", self.task_id, exc)
+            return html
+        if not result.success or result.data is None:
+            return html
+        try:
+            return result.data.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return html
+
+    # ── Media bookkeeping ───────────────────────────────────────────────────
+
+    def _register_media(self, urls, referer: str | None) -> None:
+        """Record discovered assets.
+
+        Filters are applied here rather than at each call site so that every
+        discovery route — HTML, CSS, iframes, sitemaps, feeds, browser network
+        capture — honours ``url_filters`` identically.
+        """
+        from scraper.extractor import apply_url_filters
+
+        for url in urls or []:
+            if not url:
+                continue
+            if len(self._media) >= self._max_media:
+                return
+            if not apply_url_filters([url], self._include_filters,
+                                     self._exclude_filters):
+                continue
+            self._media.setdefault(url, referer)
+
+    # ── Phase 2: transfer ───────────────────────────────────────────────────
+
+    async def _transfer_phase(self, config: CrawlConfig) -> None:
+        from db import queries as q
+
+        if self._cancelled:
+            return
+
+        if not self._media:
+            await q.update_task(self.task_id, status="completed", total_files=0,
+                                done_files=0,
+                                extra_info={"pages_crawled": self._pages_fetched,
+                                            "total_media_found": 0,
+                                            "css_files_crawled": len(self._css_seen)})
+            return
+
+        existing = await q.get_existing_download_urls(self.task_id)
+        used_names = {d.get("filename") for d in
+                      await q.list_downloads(self.task_id) if d.get("filename")}
+        new_items = []
+        for url, referer in self._media.items():
+            if url in existing:
+                continue
+            filename = self._unique_filename(url, used_names)
+            used_names.add(filename)
+            new_items.append((url, filename, referer))
+
+        if new_items:
+            await q.create_downloads_bulk(self.task_id, new_items)
 
         all_downloads = await q.list_downloads(self.task_id)
+        pending = [d for d in all_downloads if d["status"] != "completed"]
         total = len(all_downloads)
-        downloads = [d for d in all_downloads if d["status"] != "completed"]
 
-        if not downloads:
-            completed = await q.count_downloads_by_status(self.task_id, "completed")
-            await q.update_task(self.task_id, status="completed", done_files=completed)
+        await q.update_task(
+            self.task_id, total_files=total,
+            done_files=sum(1 for d in all_downloads if d["status"] == "completed"),
+            extra_info={"pages_crawled": self._pages_fetched,
+                        "total_media_found": len(self._media),
+                        "css_files_crawled": len(self._css_seen)})
+
+        if not pending:
+            await q.update_task(self.task_id, status="completed")
             return
 
-        await q.update_task(self.task_id, total_files=total,
-                            extra_info=json.dumps({
-                                "pages_crawled": len(self._visited_pages),
-                                "total_media_found": len(all_urls),
-                                "css_files_crawled": len(self._css_files_crawled),
-                            }))
+        logger.info("[Task %d] downloading %d items (concurrency=%d)",
+                    self.task_id, len(pending), config.concurrency)
 
-        # ── Phase 6: Download all ──
-        done_count = 0
-        start_time = time.time()
-        logger.info("[Task %d] Starting download phase: %d items", self.task_id, len(downloads))
+        queue: asyncio.Queue = asyncio.Queue()
+        for download in pending:
+            queue.put_nowait(download)
 
-        async def download_one(dl):
-            nonlocal done_count
-            try:
-                result = await self._download_item(
-                    dl, output_dir, headers, timeout, max_retries, request_delay,
-                    proxy=proxy, max_file_size_mb=max_file_size_mb)
-                done_count += 1
-                elapsed = time.time() - start_time
-                speed = done_count / elapsed if elapsed > 0 else 0
-                if self._progress_cb:
-                    await self._progress_cb(self.task_id, done_count, total, dl["filename"], speed)
-            except Exception as e:
-                logger.exception("Unexpected error downloading %s: %s", dl["url"], e)
-                done_count += 1
+        self._done_count = sum(1 for d in all_downloads if d["status"] == "completed")
+        self._total_count = total
+        self._started_at = time.monotonic()
+        self._progress_lock = asyncio.Lock()
 
-        # Download in batches to avoid semaphore deadlock
-        batch_size = concurrency
-        for i in range(0, len(downloads), batch_size):
-            batch = downloads[i:i + batch_size]
-            batch_tasks = [download_one(dl) for dl in batch]
-            await asyncio.gather(*batch_tasks, return_exceptions=True)
+        workers = [
+            asyncio.create_task(self._download_worker(queue, config))
+            for _ in range(config.concurrency)
+        ]
+        try:
+            await queue.join()
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
-        await self._pause_event.wait()
-        completed = await q.count_downloads_by_status(self.task_id, "completed")
-        failed_count = await q.count_downloads_by_status(self.task_id, "failed")
-        if failed_count == total:
-            await q.update_task(self.task_id, status="failed", error_msg="All downloads failed")
+        stats = await q.get_download_stats(self.task_id)
+        if stats["completed"] == 0 and stats["total"] > 0:
+            await q.update_task(self.task_id, status="failed",
+                                error_msg="All downloads failed",
+                                done_files=0)
+        elif self._cancelled:
+            await q.update_task(self.task_id, status="cancelled",
+                                done_files=stats["completed"])
         else:
-            await q.update_task(self.task_id, status="completed", done_files=completed)
+            await q.update_task(self.task_id, status="completed",
+                                done_files=stats["completed"],
+                                error_msg=None)
 
-    async def _on_progress(self, task_id, dl_id, downloaded, total):
+    def _unique_filename(self, url: str, used: set[str]) -> str:
+        """Stable, collision-free filename for a URL within this task."""
+        base = Downloader.extract_filename(url)
+        if base not in used:
+            return base
+        digest = hashlib.sha1(url.encode("utf-8", "replace")).hexdigest()[:8]
+        stem, suffix = Path(base).stem, Path(base).suffix
+        candidate = f"{stem}-{digest}{suffix}"
+        counter = 1
+        while candidate in used:
+            candidate = f"{stem}-{digest}-{counter}{suffix}"
+            counter += 1
+        return candidate
+
+    async def _download_worker(self, queue: asyncio.Queue, config: CrawlConfig) -> None:
+        while True:
+            download = await queue.get()
+            try:
+                if self._cancelled:
+                    continue
+                await self._pause_event.wait()
+                if self._cancelled:
+                    continue
+                await self._download_one(download, config)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("[Task %d] download error for %s",
+                                 self.task_id, download.get("url"))
+            finally:
+                queue.task_done()
+
+    async def _download_one(self, download: dict, config: CrawlConfig) -> None:
         from db import queries as q
-        await q.update_download(dl_id, downloaded=downloaded, file_size=total)
+
+        url = download["url"]
+        referer = download.get("referer")
+        filename = download.get("filename") or Downloader.extract_filename(url)
+        out_dir = Path(config.output_dir)
+        target = out_dir / filename
+
+        if config.request_delay_sec:
+            await asyncio.sleep(config.request_delay_sec)
+
+        async with self._global_sem:
+            await self._pause_event.wait()
+            if self._cancelled:
+                return
+
+            attempt = 0
+            while True:
+                attempt += 1
+                await q.update_download(download["id"], status="downloading",
+                                        error_msg=None)
+
+                resume_from = target.stat().st_size if target.exists() else 0
+                if resume_from and download.get("file_size") \
+                        and resume_from >= download["file_size"]:
+                    # Already complete on disk from an earlier run.
+                    await q.update_download(
+                        download["id"], status="completed", downloaded=resume_from,
+                        filepath=str(target))
+                    await self._bump_progress(filename)
+                    return
+
+                result = await self._downloader.download_file(
+                    url=url,
+                    output_dir=str(out_dir),
+                    filename=filename,
+                    dl_id=download["id"],
+                    progress_callback=self._on_download_progress,
+                    headers=build_headers(config, referer),
+                    timeout=config.request_timeout_sec,
+                    resume_from=resume_from,
+                    proxy=config.proxy,
+                    max_file_size_mb=config.max_file_size_mb,
+                    session=self.session,
+                    referer=referer,
+                )
+
+                if result.ok:
+                    await q.update_download(
+                        download["id"],
+                        status="completed",
+                        filename=result.get("filename") or filename,
+                        filepath=result.get("filepath"),
+                        file_size=result.get("file_size") or 0,
+                        downloaded=result.get("file_size") or 0,
+                        mime_type=result.get("mime_type"),
+                        error_msg=None,
+                        retry_count=attempt - 1,
+                    )
+                    await self._bump_progress(result.get("filename") or filename)
+                    return
+
+                error = result.get("error_msg") or "unknown error"
+                if attempt > config.max_retries:
+                    await q.update_download(download["id"], status="failed",
+                                            error_msg=error, retry_count=attempt - 1)
+                    await self._bump_progress(filename)
+                    logger.warning("[Task %d] gave up on %s: %s",
+                                   self.task_id, url, error)
+                    return
+
+                backoff = result.get("retry_after") or min(2 ** attempt, 60)
+                backoff += random.uniform(0, 1.5)
+                await q.update_download(download["id"], status="pending",
+                                        error_msg=error, retry_count=attempt - 1)
+                logger.debug("[Task %d] retry %d/%d for %s in %.1fs (%s)",
+                             self.task_id, attempt, config.max_retries, url,
+                             backoff, error)
+                await asyncio.sleep(backoff)
+
+    async def _on_download_progress(self, dl_id, downloaded: int,
+                                    total: int | None) -> None:
+        from db import queries as q
+
+        try:
+            await q.update_download_progress(dl_id, downloaded, total)
+        except Exception:  # noqa: BLE001 - progress must never break a download
+            logger.debug("progress update failed for download %s", dl_id)
+
+        if self._file_progress_cb:
+            try:
+                await self._file_progress_cb(self.task_id, dl_id, downloaded, total)
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _bump_progress(self, current_file: str) -> None:
+        async with self._progress_lock:
+            self._done_count += 1
+            done = self._done_count
+        elapsed = time.monotonic() - self._started_at
+        speed = done / elapsed if elapsed > 0 else 0.0
+        if self._progress_cb:
+            try:
+                await self._progress_cb(self.task_id, done, self._total_count,
+                                        current_file, speed)
+            except Exception:  # noqa: BLE001
+                logger.debug("progress callback failed for task %s", self.task_id)
+
+
+def _retry_after(resp: aiohttp.ClientResponse) -> int:
+    try:
+        return max(1, int(resp.headers.get("Retry-After", "")))
+    except (TypeError, ValueError):
+        return 30

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "auto-get-py": {
+      "command": "python",
+      "args": [
+        "mcp_server.py"
+      ],
+      "env": {
+        "AUTO_GET_BASE_URL": "http://localhost:8000"
+      },
+      "description": "Web media scraper"
+    }
+  }
+}

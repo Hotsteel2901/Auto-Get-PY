@@ -1,10 +1,23 @@
-import re
-import json
-import base64
-import unicodedata
-from urllib.parse import urljoin, urlparse, unquote, quote
-from fnmatch import fnmatch
+"""Media URL extraction.
 
+Given the HTML (or CSS, or JSON) of a page, find every URL that points at a
+downloadable asset.  Extraction is deliberately multi-strategy: sites hide
+their media in ``src``, ``srcset``, lazy-load ``data-*`` attributes, CSS
+``url()`` declarations, JSON-LD blocks, inline ``<script>`` strings,
+``<noscript>`` fallbacks and ``<template>`` markup, and a generic scraper has
+to look in all of them.
+"""
+
+from __future__ import annotations
+
+import base64
+import html as html_module
+import json
+import re
+from fnmatch import fnmatch
+from urllib.parse import (
+    quote, unquote, urljoin, urlparse, urlunparse,
+)
 
 MEDIA_EXTENSIONS = (
     # Images
@@ -12,273 +25,278 @@ MEDIA_EXTENSIONS = (
     ".tiff", ".tif", ".jfif", ".pjpeg", ".pjp",
     # Videos
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".ts", ".m3u8", ".m4v",
-    ".mpd", ".f4v", ".vob", ".ogv", ".3gp", ".3g2",
+    ".mpd", ".f4v", ".vob", ".ogv", ".3gp", ".3g2", ".m4s", ".ism",
     # Audio
     ".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a", ".opus", ".mid", ".midi",
+    ".m4b", ".aiff", ".weba",
     # Documents
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".epub", ".mobi",
-    ".csv", ".rtf", ".odt", ".ods", ".odp",
+    ".csv", ".rtf", ".odt", ".ods", ".odp", ".srt", ".vtt",
     # Archives
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst", ".tgz",
     # Fonts (frequently bundled with sites)
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
 )
 
-# ─── Original patterns (backward compatible) ────────────────────────────────
+MEDIA_EXTENSION_SET = frozenset(MEDIA_EXTENSIONS)
 
-_EXT_ALT = "|".join(ext.strip(".") for ext in MEDIA_EXTENSIONS)
+_EXT_ALT = "|".join(ext.lstrip(".") for ext in MEDIA_EXTENSIONS)
 
+# Schemes that never point at a downloadable file.
+_REJECTED_SCHEMES = ("data:", "javascript:", "mailto:", "tel:", "about:", "blob:", "chrome:")
+
+# Characters that are safe to leave unescaped inside a URL path/query.
+_PATH_SAFE = "/%:@!$&'()*+,;=~-._"
+_QUERY_SAFE = "=&%:;+,?/@!$'()*~-._[]"
+
+# ─── Core patterns ──────────────────────────────────────────────────────────
+
+# The trailing ``[^"']*`` keeps query strings and chained suffixes
+# (``archive.tar.gz``, ``img.jpg?w=800&sig=…``) attached to the captured URL.
 URL_PATTERN = re.compile(
-    r"""(?i)(?:src|href|data-src|data-url|content)\s*=\s*["']([^"']+\.(?:"""
-    + _EXT_ALT + r"""))["']"""
+    r"""(?i)(?:src|href|data-src|data-url|content|poster)\s*=\s*["']([^"']+\.(?:"""
+    + _EXT_ALT + r""")[^"']*)["']"""
 )
 
-M3U8_PATTERN = re.compile(r'["\']([^"\']+\.m3u8[^"\']*)["\']')
+M3U8_PATTERN = re.compile(r'["\']([^"\']+\.(?:m3u8|mpd)[^"\']*)["\']')
 
 GENERIC_URL_PATTERN = re.compile(
     r'(?i)(?:src|href|data-src|data-url)\s*=\s*["\']([^"\']+)["\']'
 )
 
-# ─── Enhanced patterns ──────────────────────────────────────────────────────
+SOURCE_TAG_PATTERN = re.compile(r'(?i)<source\s+[^>]*?src\s*=\s*["\']([^"\']+)["\']')
 
-# 1. <source src="..."> inside <video>/<audio>/<picture>
-SOURCE_TAG_PATTERN = re.compile(
-    r'(?i)<source\s+[^>]*?src\s*=\s*["\']([^"\']+)["\']'
-)
+POSTER_PATTERN = re.compile(r'(?i)<video\s+[^>]*?poster\s*=\s*["\']([^"\']+)["\']')
 
-# 2. poster attribute on <video>
-POSTER_PATTERN = re.compile(
-    r'(?i)<video\s+[^>]*?poster\s*=\s*["\']([^"\']+)["\']'
-)
+SRCSET_PATTERN = re.compile(r'(?i)(?:srcset|data-srcset)\s*=\s*["\']([^"\']+)["\']')
 
-# 3. srcset / data-srcset
-SRCSET_PATTERN = re.compile(
-    r'(?i)(?:srcset|data-srcset)\s*=\s*["\']([^"\']+)["\']'
-)
-
-# 4. Lazy-load data-* attributes
 LAZY_LOAD_PATTERN = re.compile(
     r'(?i)data-(?:original|lazy-src|actualsrc|original-src|hi-res-src|'
-    r'full-src|image|img-src|bg|background|large-image|zoom-image|hd-src|big-src)'
+    r'full-src|image|img-src|bg|background|large-image|zoom-image|hd-src|big-src|'
+    r'url|source|video|file|download|thumb|thumbnail)'
     r'\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 5. CSS background-image: url(...)
 CSS_BG_PATTERN = re.compile(
     r"""(?i)background(?:-image)?\s*:\s*url\(\s*["']?([^"')]+\.(?:"""
-    + _EXT_ALT + r"""))["']?\s*\)"""
+    + _EXT_ALT + r""")[^"')]*)["']?\s*\)"""
 )
 
-# 6. CSS url() in style attributes
 STYLE_URL_PATTERN = re.compile(
     r'(?i)style\s*=\s*["\'][^"\']*?url\(\s*["\']?([^"\')\s]+)["\']?\s*\)'
 )
 
-# 7. URLs inside JavaScript strings
 JS_STRING_URL_PATTERN = re.compile(
-    r"""(?i)(["'])((?:https?://|//)[^"'\s]+\.(?:"""
-    + _EXT_ALT + r"""))\1"""
+    r"""(?i)(["'])((?:https?://|//)[^"'\s]+\.(?:""" + _EXT_ALT + r""")[^"'\s]*)\1"""
 )
 
-# 8. <img>/<video>/<source> with data-* lazy-load attributes
+# URLs escaped inside JSON string literals: https:\/\/cdn.example.com\/a.jpg
+JSON_ESCAPED_URL_PATTERN = re.compile(
+    r"""(?i)["']((?:https?:)?\\?/\\?/[^"'\s]+?\.(?:""" + _EXT_ALT + r""")[^"'\s]*?)["']"""
+)
+
 DATA_IMG_PATTERN = re.compile(
-    r'(?i)<(?:img|video|source)\s+[^>]*?data-(?:src|original|lazy|url)[^>]*?=\s*["\']([^"\']+)["\']'
+    r'(?i)<(?:img|video|source|a|div)\s+[^>]*?data-(?:src|original|lazy|url)'
+    r'[^>]*?=\s*["\']([^"\']+)["\']'
 )
 
-# 9. JSON-LD contentUrl / embedUrl / url
 JSON_LD_CONTENT_URL = re.compile(
-    r'(?i)"(?:contentUrl|embedUrl|thumbnailUrl|url)"\s*:\s*"((?:https?://|//)[^"]+)"'
+    r'(?i)"(?:contentUrl|embedUrl|thumbnailUrl|url|image|src|videoUrl|audioUrl|file)"'
+    r'\s*:\s*"((?:https?://|//|/)[^"]+)"'
 )
 
-# 10. Open Graph meta tags (including og:video:secure_url, og:image:url)
 OG_MEDIA_PATTERN = re.compile(
-    r'(?i)<meta\s+(?:property|name)\s*=\s*["\']og:(?:image|video|audio)(?::url|:secure_url)?["\']'
-    r'\s+content\s*=\s*["\']([^"\']+)["\']'
+    r'(?i)<meta\s+(?:property|name)\s*=\s*["\']og:(?:image|video|audio)'
+    r'(?::url|:secure_url)?["\']\s+content\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 11. href pointing to direct download pages
 HREF_DOWNLOAD_PATTERN = re.compile(
-    r"""(?i)href\s*=\s*["']([^"']*(?:download|file|attachment)[^"']*\.(?:"""
-    + _EXT_ALT + r"""))["']"""
+    r"""(?i)href\s*=\s*["']([^"']*(?:download|file|attachment|media|video|audio|image)"""
+    r"""[^"']*\.(?:""" + _EXT_ALT + r""")[^"']*)["']"""
 )
 
-# 12. Quoted media URLs in page source
 BARE_MEDIA_URL_PATTERN = re.compile(
-    r"""(?i)(["'])((?:https?://|//)[^"'\s]{10,}\.(?:"""
-    + _EXT_ALT + r"""))\1"""
+    r"""(?i)(["'])((?:https?://|//)[^"'\s]{10,}\.(?:""" + _EXT_ALT + r"""))\1"""
 )
 
-# ─── NEW: Deeper extraction patterns ────────────────────────────────────────
-
-# 13. Inline base64 images: data:image/png;base64,XXXXX
 BASE64_IMG_PATTERN = re.compile(
-    r'data:(image/(?:png|jpeg|gif|webp|svg\+xml|bmp|avif|tiff));base64,([A-Za-z0-9+/=\s]{50,})'
+    r'data:(image/(?:png|jpeg|jpg|gif|webp|svg\+xml|bmp|avif|tiff));base64,'
+    r'([A-Za-z0-9+/=\s]{50,})'
 )
 
-# 14. CSS @import url(...)
 CSS_IMPORT_PATTERN = re.compile(
     r'(?i)@import\s+(?:url\(\s*)?["\']?([^"\')\s]+\.css[^"\')\s]*)["\']?\s*\)?'
 )
 
-# 15. CSS @font-face src: url(...)
 CSS_FONT_URL_PATTERN = re.compile(
-    r'(?i)@font-face\s*\{[^}]*?src\s*:[^}]*?url\(\s*["\']?([^"\')\s]+\.(?:woff2?|ttf|otf|eot))["\']?\s*\)',
+    r'(?i)@font-face\s*\{[^}]*?src\s*:[^}]*?url\(\s*["\']?([^"\')\s]+\.(?:woff2?|ttf|otf|eot))'
+    r'["\']?\s*\)',
     re.DOTALL,
 )
 
-# 16. CSS url() — any url() in CSS (broader than just background)
 CSS_ANY_URL_PATTERN = re.compile(
-    r'(?i)url\(\s*["\']?([^"\')\s]+\.(?:' + _EXT_ALT + r'))["\']?\s*\)'
+    r'(?i)url\(\s*["\']?([^"\')\s]+\.(?:' + _EXT_ALT + r')[^"\')\s]*)["\']?\s*\)'
 )
 
-# 17. <iframe src="...">
-IFRAME_PATTERN = re.compile(
-    r'(?i)<iframe\s+[^>]*?src\s*=\s*["\']([^"\']+)["\']'
-)
+IFRAME_PATTERN = re.compile(r'(?i)<iframe\s+[^>]*?src\s*=\s*["\']([^"\']+)["\']')
 
-# 18. <embed src="..."> / <object data="...">
 EMBED_OBJECT_PATTERN = re.compile(
     r'(?i)<(?:embed|object)\s+[^>]*?(?:src|data)\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 19. Schema.org VideoObject / ImageObject
 SCHEMA_MEDIA_PATTERN = re.compile(
     r'(?i)"(?:thumbnailUrl|contentUrl|embedUrl|url|image)"\s*:\s*'
     r'(?:"([^"]+)"|\[([^\]]+)\])'
 )
 
-# 20. <picture> <source srcset="...">
-PICTURE_SOURCE_PATTERN = re.compile(
-    r'(?i)<picture\s*>(.*?)</picture>', re.DOTALL
-)
+PICTURE_SOURCE_PATTERN = re.compile(r'(?i)<picture\s*>(.*?)</picture>', re.DOTALL)
 
-# 21. <video>/<audio> inner <source> — extract all sources from media tags
-MEDIA_TAG_PATTERN = re.compile(
-    r'(?i)<(?:video|audio)\s[^>]*>(.*?)</(?:video|audio)>', re.DOTALL
-)
+MEDIA_TAG_PATTERN = re.compile(r'(?i)<(?:video|audio)\s[^>]*>(.*?)</(?:video|audio)>', re.DOTALL)
 
-# 22. <link rel="preload/as" href="..."> for fonts/images
 LINK_PRELOAD_PATTERN = re.compile(
-    r'(?i)<link\s+[^>]*?rel\s*=\s*["\'](?:preload|prefetch)["\']'
+    r'(?i)<link\s+[^>]*?rel\s*=\s*["\'](?:preload|prefetch|apple-touch-icon)["\']'
     r'[^>]*?href\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 23. <meta name="twitter:image" content="...">
 TWITTER_MEDIA_PATTERN = re.compile(
     r'(?i)<meta\s+(?:property|name)\s*=\s*["\']twitter:(?:image|player)(?::src)?["\']'
     r'\s+content\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 24. Common CDN / storage URL patterns in scripts
 CDN_URL_PATTERN = re.compile(
     r"""(?i)(["'])((?:https?://|//)[^"'\s]*(?:"""
-    r"""cdn|static|assets|media|upload|storage|cloudfront|akamai|imgix|cloudinary"""
-    r""")[^"'\s]*\.(?:""" + _EXT_ALT + r"""))\1"""
+    r"""cdn|static|assets|media|upload|storage|cloudfront|akamai|imgix|cloudinary|"""
+    r"""aliyuncs|myqcloud|b-cdn|fastly)"""
+    r"""[^"'\s]*\.(?:""" + _EXT_ALT + r"""))(?:[?#][^"'\s]*)?\1"""
 )
 
-# 25. <video>/<audio> src directly
 VIDEO_AUDIO_SRC_PATTERN = re.compile(
     r'(?i)<(?:video|audio)\s+[^>]*?src\s*=\s*["\']([^"\']+)["\']'
 )
 
-# 26. <img srcset> with multiple URLs — enhanced for <picture>
-SRCSET_FULL_PATTERN = re.compile(
-    r'(?i)srcset\s*=\s*["\']([^"\']+)["\']'
-)
+SRCSET_FULL_PATTERN = re.compile(r'(?i)srcset\s*=\s*["\']([^"\']+)["\']')
 
-# 27. Blob URLs (from JS-created object URLs)
-BLOB_URL_PATTERN = re.compile(
-    r'(blob:[^"\'<>\s]+)'
-)
+BLOB_URL_PATTERN = re.compile(r'(blob:[^"\'<>\s]+)')
 
-
-def _is_media_url(url: str) -> bool:
-    """Check if URL points to a media file based on extension."""
-    parsed = urlparse(url)
-    path = parsed.path.lower().split('?')[0].split('#')[0]
-    return any(path.endswith(ext) for ext in MEDIA_EXTENSIONS)
-
-
-def _normalize_url(url: str, base_url: str) -> str | None:
-    """Normalize and resolve a URL. Returns None if invalid.
-
-    Handles:
-    - Unicode/Chinese characters in URLs (percent-encodes them)
-    - IDN domains (punycode)
-    - HTML entity decoding (&amp; → &)
-    - Double-encoding detection
-    """
-    if not url or not url.strip():
-        return None
-    url = url.strip()
-    if url.startswith(('data:', 'javascript:', 'mailto:', 'tel:', '#')):
-        return None
-
-    # Unescape HTML entities
-    url = url.replace('&amp;', '&').replace('&#38;', '&')
-    url = url.replace('&lt;', '<').replace('&gt;', '>')
-    url = url.replace('&#39;', "'").replace('&quot;', '"')
-
-    # Decode percent-encoded chars then re-encode non-ASCII properly
-    try:
-        decoded = unquote(url, encoding='utf-8', errors='replace')
-    except Exception:
-        decoded = url
-
-    if url.startswith('//'):
-        parsed_base = urlparse(base_url)
-        url = f"{parsed_base.scheme}:{decoded}"
-    elif not url.startswith(('http://', 'https://')):
-        url = urljoin(base_url, decoded)
-    else:
-        url = decoded
-
-    # Re-encode non-ASCII characters in the path (Chinese, Japanese, etc.)
-    parsed = urlparse(url)
-    path = parsed.path
-    # Only encode chars that are not already percent-encoded and are non-ASCII
-    if any(ord(c) > 127 for c in path):
-        # Encode each path segment separately to preserve /
-        segments = path.split('/')
-        encoded_segments = []
-        for seg in segments:
-            if any(ord(c) > 127 for c in seg):
-                seg = quote(seg, safe='')
-            encoded_segments.append(seg)
-        path = '/'.join(encoded_segments)
-        url = f"{parsed.scheme}://{parsed.netloc}{path}"
-        if parsed.query:
-            url += f"?{parsed.query}"
-        if parsed.fragment:
-            url += f"#{parsed.fragment}"
-
-    return url
-
+_NOSCRIPT_PATTERN = re.compile(r'(?i)<noscript[^>]*>(.*?)</noscript>', re.DOTALL)
+_TEMPLATE_PATTERN = re.compile(r'(?i)<template[^>]*>(.*?)</template>', re.DOTALL)
 
 _DIRECT_SEGMENTS = frozenset({
-    "download", "file", "files", "attachment", "attachments",
-    "media", "video", "audio", "image", "uploads", "upload",
-    "assets", "static", "cdn",
+    "download", "downloads", "file", "files", "attachment", "attachments",
+    "media", "video", "videos", "audio", "image", "images", "uploads", "upload",
+    "assets", "static", "cdn", "storage", "get", "stream",
+})
+
+_SKIP_EXTENSIONS = frozenset({
+    ".css", ".js", ".json", ".xml", ".rss", ".atom", ".map",
+})
+
+_HTML_DOC_EXTENSIONS = frozenset({
+    ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".do", ".action",
+})
+
+# Pages that are almost certainly not worth crawling.
+_SKIP_LINK_WORDS = frozenset({
+    "login", "logout", "signup", "signin", "register", "cart", "checkout",
+    "privacy", "terms", "cookie", "unsubscribe",
 })
 
 
-def _is_direct_link(url: str) -> bool:
+# ── URL normalisation ───────────────────────────────────────────────────────
+
+
+def _idna_host(netloc: str) -> str:
+    """Encode an internationalised host to punycode, keeping userinfo/port."""
+    if not netloc or netloc.isascii():
+        return netloc
+    userinfo = ""
+    if "@" in netloc:
+        userinfo, netloc = netloc.rsplit("@", 1)
+        userinfo += "@"
+    host, sep, port = netloc.rpartition(":")
+    if not sep or not port.isdigit():
+        host, port, sep = netloc, "", ""
+    try:
+        return f"{userinfo}{host.encode('idna').decode('ascii')}{sep}{port}"
+    except (UnicodeError, UnicodeDecodeError):
+        return f"{userinfo}{host}{sep}{port}"
+
+
+def _encode_url(raw: str) -> str:
+    """Percent-encode a URL, preserving escapes that are already valid."""
+    parsed = urlparse(raw)
+    path = quote(parsed.path, safe=_PATH_SAFE)
+    query = quote(parsed.query, safe=_QUERY_SAFE)
+    return urlunparse((
+        parsed.scheme.lower(),
+        _idna_host(parsed.netloc.lower()),
+        path,
+        parsed.params,
+        query,
+        "",  # fragments never identify a distinct asset
+    ))
+
+
+def _normalize_url(url: str, base_url: str) -> str | None:
+    """Resolve ``url`` against ``base_url`` and make it safe to request.
+
+    Handles HTML entities, protocol-relative URLs, internationalised domains,
+    spaces and non-ASCII path segments. Returns ``None`` for anything that
+    cannot be an http(s) asset.
+    """
+    if not url:
+        return None
+    url = html_module.unescape(str(url)).strip().strip("\"'")
+    if not url or url.startswith("#") or url.startswith(_REJECTED_SCHEMES):
+        return None
+    # Undo the escaping that URLs pick up inside JS/JSON string literals.
+    url = url.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    url = url.lstrip("\u0000-\u001f").strip()
+    if not url or url.startswith("#") or url.startswith(_REJECTED_SCHEMES):
+        return None
+
+    if url.startswith("//"):
+        url = f"{urlparse(base_url).scheme or 'https'}:{url}"
+    elif not url.startswith(("http://", "https://")):
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:", url):
+            return None  # some other scheme (ftp:, ws:, …)
+        url = urljoin(base_url, url)
+
+    try:
+        encoded = _encode_url(url)
+    except (ValueError, UnicodeError):
+        return None
+
+    parsed = urlparse(encoded)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return encoded
+
+
+def _is_media_url(url: str) -> bool:
+    """True when the URL path ends in a known media extension."""
     parsed = urlparse(url)
     path = parsed.path.lower()
-    path_segments = [s for s in path.split("/") if s]
-    if any(seg in _DIRECT_SEGMENTS for seg in path_segments):
+    return any(path.endswith(ext) for ext in MEDIA_EXTENSION_SET)
+
+
+def _is_direct_link(url: str) -> bool:
+    """True when a URL looks like a file rather than an HTML page."""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    if any(seg in _DIRECT_SEGMENTS for seg in path.split("/") if seg):
         return True
     if parsed.query:
-        query_params = parsed.query.lower()
-        if 'download' in query_params or 'file=' in query_params:
+        query = parsed.query.lower()
+        if "download" in query or "file=" in query or "filename=" in query:
             return True
     return _is_media_url(url)
 
 
 def _parse_srcset(srcset_value: str, base_url: str) -> list[str]:
-    """Parse srcset attribute, returning list of resolved URLs."""
+    """Parse a ``srcset`` attribute into resolved URLs."""
     urls = []
-    for part in srcset_value.split(','):
+    for part in srcset_value.split(","):
         part = part.strip()
         if not part:
             continue
@@ -290,442 +308,386 @@ def _parse_srcset(srcset_value: str, base_url: str) -> list[str]:
     return urls
 
 
+def _walk_json_for_urls(obj, urls: list, base_url: str) -> None:
+    """Recursively collect URL-ish string values from decoded JSON."""
+    if isinstance(obj, dict):
+        for value in obj.values():
+            _walk_json_for_urls(value, urls, base_url)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_json_for_urls(item, urls, base_url)
+    elif isinstance(obj, str) and obj.startswith(("http://", "https://", "//", "/")):
+        if _is_media_url(obj) or _is_direct_link(obj):
+            normalized = _normalize_url(obj, base_url)
+            if normalized:
+                urls.append(normalized)
+
+
 def _extract_json_urls(text: str, base_url: str) -> list[str]:
-    """Extract URLs from JSON-like structures in the text."""
-    urls = []
-    # Match JSON objects
-    for match in re.finditer(r'\{[^{}]{10,}\}', text):
+    """Pull URLs out of JSON objects and arrays embedded in the page."""
+    urls: list[str] = []
+    for match in re.finditer(r"\{[^{}]{10,}\}", text):
         try:
-            obj = json.loads(match.group())
-            _walk_json_for_urls(obj, urls, base_url)
+            _walk_json_for_urls(json.loads(match.group()), urls, base_url)
         except (json.JSONDecodeError, RecursionError):
             pass
-    # Match JSON arrays
-    for match in re.finditer(r'\[[^\[\]]{20,}\]', text):
+    for match in re.finditer(r"\[[^\[\]]{20,}\]", text):
         try:
-            obj = json.loads(match.group())
-            _walk_json_for_urls(obj, urls, base_url)
+            _walk_json_for_urls(json.loads(match.group()), urls, base_url)
         except (json.JSONDecodeError, RecursionError):
             pass
     return urls
 
 
-def _walk_json_for_urls(obj, urls: list, base_url: str):
-    """Recursively walk JSON object looking for URL values."""
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(value, str):
-                if value.startswith(('http://', 'https://', '//')):
-                    if _is_media_url(value):
-                        normalized = _normalize_url(value, base_url)
-                        if normalized:
-                            urls.append(normalized)
-                elif value.startswith('data:image/'):
-                    pass  # handled by base64 extractor
-            elif isinstance(value, (dict, list)):
-                _walk_json_for_urls(value, urls, base_url)
-    elif isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, (dict, list)):
-                _walk_json_for_urls(item, urls, base_url)
-            elif isinstance(item, str) and item.startswith(('http://', 'https://', '//')):
-                if _is_media_url(item):
-                    normalized = _normalize_url(item, base_url)
-                    if normalized:
-                        urls.append(normalized)
+# ── Main extractor ──────────────────────────────────────────────────────────
 
 
 def extract_media_urls(html: str, base_url: str,
-                       include_filters: list[str] = None,
-                       exclude_filters: list[str] = None) -> list[str]:
-    """Extract media URLs from HTML using 20+ strategies."""
-    urls = set()
+                       include_filters: list[str] | None = None,
+                       exclude_filters: list[str] | None = None) -> list[str]:
+    """Extract every downloadable media URL from a page."""
+    if not html:
+        return []
+    urls: set[str] = set()
 
-    # ── Core strategies (backward compatible) ──
+    def add(raw: str) -> None:
+        resolved = _normalize_url(raw, base_url)
+        if resolved:
+            urls.add(resolved)
 
+    def add_all(raw_list) -> None:
+        for item in raw_list:
+            add(item)
+
+    # 1. Direct attribute matches (src/href/poster/data-src, with extension).
     for match in URL_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
+        add(match.group(1))
 
+    # 2. Playlists announced anywhere in quotes (may have query strings).
     for match in M3U8_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
+        add(match.group(1))
 
+    # 3. Attribute values that resolve to something file-shaped.
     for match in GENERIC_URL_PATTERN.finditer(html):
-        url = match.group(1)
-        if not url.startswith(('http://', 'https://', '//')):
+        candidate = match.group(1)
+        if not candidate.startswith(("http://", "https://", "//")):
             continue
-        if url.endswith(('.html', '.htm', '.php', '.asp', '.aspx', '.jsp')):
+        if candidate.lower().endswith(tuple(_HTML_DOC_EXTENSIONS)):
             continue
-        if '#' in url and not url.endswith(('.m3u8',)):
+        if "#" in candidate and not candidate.endswith((".m3u8", ".mpd")):
             continue
-        full_url = _normalize_url(url, base_url)
-        if full_url and _is_direct_link(full_url):
-            urls.add(full_url)
+        resolved = _normalize_url(candidate, base_url)
+        if resolved and _is_direct_link(resolved):
+            urls.add(resolved)
 
-    # ── Enhanced strategies ──
+    # 4. Dedicated tag/attribute passes.
+    for pattern in (
+        SOURCE_TAG_PATTERN, POSTER_PATTERN, LAZY_LOAD_PATTERN, CSS_BG_PATTERN,
+        JS_STRING_URL_PATTERN, JSON_ESCAPED_URL_PATTERN, OG_MEDIA_PATTERN,
+        BARE_MEDIA_URL_PATTERN, HREF_DOWNLOAD_PATTERN, CSS_ANY_URL_PATTERN,
+        VIDEO_AUDIO_SRC_PATTERN, EMBED_OBJECT_PATTERN, TWITTER_MEDIA_PATTERN,
+    ):
+        for match in pattern.finditer(html):
+            add(match.group(match.lastindex or 1))
 
-    # <source> tags
-    for match in SOURCE_TAG_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # video poster
-    for match in POSTER_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # srcset
+    # 5. srcset — several candidate URLs per attribute.
     for match in SRCSET_PATTERN.finditer(html):
-        for url in _parse_srcset(match.group(1), base_url):
-            urls.add(url)
+        add_all(_parse_srcset(match.group(1), base_url))
 
-    # Lazy-load data-*
-    for match in LAZY_LOAD_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # CSS background-image
-    for match in CSS_BG_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # Style attribute url()
+    # 6. style="... url(...)" — only when the target really is media.
     for match in STYLE_URL_PATTERN.finditer(html):
         candidate = match.group(1)
-        url = _normalize_url(candidate, base_url)
-        if url and _is_media_url(candidate):
-            urls.add(url)
+        if _is_media_url(candidate) or _looks_like_media_path(candidate):
+            add(candidate)
 
-    # JS string URLs
-    for match in JS_STRING_URL_PATTERN.finditer(html):
-        url = _normalize_url(match.group(2), base_url)
-        if url:
-            urls.add(url)
-
-    # JSON-LD
+    # 7. Anything inside a JSON string.
     for match in JSON_LD_CONTENT_URL.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
+        add(match.group(1))
 
-    # Open Graph
-    for match in OG_MEDIA_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
+    # 8. Recursively walk embedded JSON blobs.
+    add_all(_extract_json_urls(html, base_url))
 
-    # Bare media URLs in quotes
-    for match in BARE_MEDIA_URL_PATTERN.finditer(html):
-        url = _normalize_url(match.group(2), base_url)
-        if url:
-            urls.add(url)
-
-    # Deep JSON extraction
-    for url in _extract_json_urls(html, base_url):
-        urls.add(url)
-
-    # href download links
-    for match in HREF_DOWNLOAD_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # ── NEW deep strategies ──
-
-    # CSS any url() — catches fonts, images in inline styles, etc.
-    for match in CSS_ANY_URL_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # <video>/<audio> direct src
-    for match in VIDEO_AUDIO_SRC_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # <embed> / <object>
-    for match in EMBED_OBJECT_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # <link rel="preload/prefetch">
+    # 9. rel="preload" targets, but only genuine media.
     for match in LINK_PRELOAD_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url and _is_media_url(url):
-            urls.add(url)
+        resolved = _normalize_url(match.group(1), base_url)
+        if resolved and _is_media_url(resolved):
+            urls.add(resolved)
 
-    # Twitter card media
-    for match in TWITTER_MEDIA_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-
-    # Schema.org VideoObject/ImageObject (nested in JSON-LD)
+    # 10. Schema.org values, including JSON arrays.
     for match in SCHEMA_MEDIA_PATTERN.finditer(html):
         raw = match.group(1) or match.group(2)
-        if raw:
-            # Could be a single URL or a JSON array
-            if raw.startswith('['):
-                try:
-                    arr = json.loads(raw)
-                    for item in arr:
-                        if isinstance(item, str):
-                            url = _normalize_url(item, base_url)
-                            if url:
-                                urls.add(url)
-                except json.JSONDecodeError:
-                    pass
-            else:
-                url = _normalize_url(raw, base_url)
-                if url:
-                    urls.add(url)
+        if not raw:
+            continue
+        if raw.strip().startswith("["):
+            try:
+                add_all(json.loads(raw))
+            except json.JSONDecodeError:
+                pass
+        else:
+            add(raw)
 
-    # CDN URLs in scripts
+    # 11. CDN-hosted assets referenced from script strings.
     for match in CDN_URL_PATTERN.finditer(html):
-        url = _normalize_url(match.group(2), base_url)
-        if url:
-            urls.add(url)
+        add(match.group(2))
 
-    # <picture> <source> extraction
+    # 12. <picture> and <video>/<audio> internals.
     for pic_match in PICTURE_SOURCE_PATTERN.finditer(html):
-        pic_html = pic_match.group(1)
-        for src_match in SRCSET_FULL_PATTERN.finditer(pic_html):
-            for url in _parse_srcset(src_match.group(1), base_url):
-                urls.add(url)
-        for src_match in SOURCE_TAG_PATTERN.finditer(pic_html):
-            url = _normalize_url(src_match.group(1), base_url)
-            if url:
-                urls.add(url)
+        inner = pic_match.group(1)
+        for src_match in SRCSET_FULL_PATTERN.finditer(inner):
+            add_all(_parse_srcset(src_match.group(1), base_url))
+        for src_match in SOURCE_TAG_PATTERN.finditer(inner):
+            add(src_match.group(1))
 
-    # <video>/<audio> inner sources
     for media_match in MEDIA_TAG_PATTERN.finditer(html):
-        inner = media_match.group(1)
-        for src_match in re.finditer(r'(?i)src\s*=\s*["\']([^"\']+)["\']', inner):
-            url = _normalize_url(src_match.group(1), base_url)
-            if url:
-                urls.add(url)
+        for src_match in re.finditer(r'(?i)src\s*=\s*["\']([^"\']+)["\']',
+                                     media_match.group(1)):
+            add(src_match.group(1))
 
-    # ── Apply filters ──
+    add_all(_extract_noscript_template_urls(html, base_url))
+
     result = list(urls)
-
-    if include_filters:
-        result = [u for u in result if any(
-            fnmatch(urlparse(u).path.lower(), f.lower()) for f in include_filters
-        )]
-
-    if exclude_filters:
-        result = [u for u in result if not any(
-            fnmatch(urlparse(u).path.lower(), f.lower()) for f in exclude_filters
-        )]
-
-    return result
+    return apply_url_filters(result, include_filters, exclude_filters)
 
 
-def extract_inline_base64_images(html: str, output_dir: str = None) -> list[dict]:
-    """Extract inline base64-encoded images and optionally save to disk.
+def _looks_like_media_path(candidate: str) -> bool:
+    """Loosely match paths like ``/media/12345`` used by extension-less CDNs."""
+    segments = [seg for seg in urlparse(candidate).path.lower().split("/") if seg]
+    return any(seg in _DIRECT_SEGMENTS for seg in segments[:-1])
 
-    Returns list of:
-        [{"format": "png", "size": 12345, "data": bytes, "saved_path": str|None}]
+
+def apply_url_filters(urls: list[str], include_filters: list[str] | None,
+                      exclude_filters: list[str] | None) -> list[str]:
+    """Apply ``*.ext`` include/exclude globs to a list of URLs.
+
+    Exposed publicly so the engine can apply the same rules to assets it finds
+    outside the HTML parser (stylesheets, feeds, browser network capture).
     """
+    if include_filters:
+        urls = [u for u in urls if any(
+            fnmatch(urlparse(u).path.lower(), f.lower()) for f in include_filters)]
+    if exclude_filters:
+        urls = [u for u in urls if not any(
+            fnmatch(urlparse(u).path.lower(), f.lower()) for f in exclude_filters)]
+    return urls
+
+
+_apply_filters = apply_url_filters  # backwards-compatible private alias
+
+
+def _extract_noscript_template_urls(html: str, base_url: str) -> list[str]:
+    """Media inside <noscript>/<template>: the real URLs on lazy-loading sites."""
+    if not html:
+        return []
+    found: set[str] = set()
+    for pattern in (_NOSCRIPT_PATTERN, _TEMPLATE_PATTERN):
+        for match in pattern.finditer(html):
+            inner = match.group(1)
+            for sub in (URL_PATTERN, SOURCE_TAG_PATTERN, LAZY_LOAD_PATTERN,
+                        DATA_IMG_PATTERN, SRCSET_FULL_PATTERN):
+                for sub_match in sub.finditer(inner):
+                    value = sub_match.group(sub_match.lastindex or 1)
+                    if sub is SRCSET_FULL_PATTERN:
+                        for parsed in _parse_srcset(value, base_url):
+                            found.add(parsed)
+                        continue
+                    resolved = _normalize_url(value, base_url)
+                    if resolved:
+                        found.add(resolved)
+    return list(found)
+
+
+def extract_noscript_template_urls(html: str, base_url: str) -> list[str]:
+    """Public wrapper around the <noscript>/<template> scan."""
+    return _extract_noscript_template_urls(html, base_url)
+
+
+def extract_inline_base64_images(html: str, output_dir: str | None = None) -> list[dict]:
+    """Decode inline ``data:image/...;base64`` payloads, optionally saving them."""
+    from pathlib import Path
+
     results = []
-    for match in BASE64_IMG_PATTERN.finditer(html):
-        fmt = match.group(1).split('/')[-1].replace('+xml', '')
-        data_str = match.group(2).replace('\n', '').replace('\r', '').replace(' ', '')
+    for match in BASE64_IMG_PATTERN.finditer(html or ""):
+        fmt = match.group(1).split("/")[-1].replace("+xml", "").replace("jpg", "jpg")
+        payload = re.sub(r"\s+", "", match.group(2))
         try:
-            data = base64.b64decode(data_str)
-            entry = {"format": fmt, "size": len(data), "data": data, "saved_path": None}
-            if output_dir and len(data) > 1024:  # only save images > 1KB
-                import hashlib
-                from pathlib import Path
-                h = hashlib.md5(data).hexdigest()[:12]
-                fname = f"inline_{h}.{fmt}"
-                fpath = Path(output_dir) / fname
+            data = base64.b64decode(payload, validate=False)
+        except Exception:
+            continue
+        entry = {"format": fmt, "size": len(data), "data": data, "saved_path": None}
+        if output_dir and len(data) > 1024:
+            import hashlib
+
+            digest = hashlib.md5(data).hexdigest()[:12]
+            fpath = Path(output_dir) / f"inline_{digest}.{fmt}"
+            try:
                 if not fpath.exists():
                     fpath.write_bytes(data)
                 entry["saved_path"] = str(fpath)
-            results.append(entry)
-        except Exception:
-            continue
+            except OSError:
+                pass
+        results.append(entry)
     return results
 
 
-def extract_css_urls(css_text: str, base_url: str) -> list[str]:
-    """Extract all media URLs from CSS content (for crawling external CSS files)."""
-    urls = set()
-    # url() references
-    for match in CSS_ANY_URL_PATTERN.finditer(css_text):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-    # @font-face src
-    for match in CSS_FONT_URL_PATTERN.finditer(css_text):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            urls.add(url)
-    # @import — return these as CSS file URLs to crawl further
-    imports = []
-    for match in CSS_IMPORT_PATTERN.finditer(css_text):
-        url = _normalize_url(match.group(1), base_url)
-        if url:
-            imports.append(url)
-    return list(urls), imports
+def extract_css_urls(css_text: str, base_url: str) -> tuple[list[str], list[str]]:
+    """Return ``(media_urls, imported_css_urls)`` for a stylesheet."""
+    media: set[str] = set()
+    for pattern in (CSS_ANY_URL_PATTERN, CSS_FONT_URL_PATTERN, CSS_BG_PATTERN):
+        for match in pattern.finditer(css_text or ""):
+            resolved = _normalize_url(match.group(1), base_url)
+            if resolved:
+                media.add(resolved)
+
+    imports: list[str] = []
+    for match in CSS_IMPORT_PATTERN.finditer(css_text or ""):
+        resolved = _normalize_url(match.group(1), base_url)
+        if resolved and resolved not in imports:
+            imports.append(resolved)
+    return list(media), imports
 
 
-# ── Pagination & link discovery ─────────────────────────────────────────────
+# ── Pagination ──────────────────────────────────────────────────────────────
 
-_NEXT_PAGE_PATTERNS = [
-    # rel="next" patterns
-    re.compile(r'(?i)<a\s+[^>]*?rel\s*=\s*["\'](?:[^"\']*\s)?next(?:\s[^"\']*)?["\'][^>]*?href\s*=\s*["\']([^"\']+)["\']'),
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*?rel\s*=\s*["\'](?:[^"\']*\s)?next(?:\s[^"\']*)?["\']'),
+_NEXT_PAGE_PATTERNS = (
+    re.compile(r'(?i)<a\s+[^>]*?rel\s*=\s*["\'](?:[^"\']*\s)?next(?:\s[^"\']*)?["\']'
+               r'[^>]*?href\s*=\s*["\']([^"\']+)["\']'),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*?rel\s*=\s*["\']'
+               r'(?:[^"\']*\s)?next(?:\s[^"\']*)?["\']'),
     re.compile(r'(?i)<link\s+[^>]*?rel\s*=\s*["\']next["\'][^>]*?href\s*=\s*["\']([^"\']+)["\']'),
-    # Chinese text patterns (下一页/下一頁/后页/后页/下页/>>/≫)
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*(?:下一页|下一頁|后页|後頁|下页|下頁)\s*</a>', re.DOTALL),
-    # Unicode arrows and chevrons
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*(?:next|›|»|→|>|≫|▶|>>)\s*</a>', re.DOTALL),
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*Next\s*Page\s*</a>', re.DOTALL),
-    # Class-based patterns (next, pagination-next, page-next, 后页, 下一页)
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*?class\s*=\s*["\'][^"\']*?(?:next|pagination-next|page-next|btn-next)[^"\']*?["\']'),
-    re.compile(r'(?i)<a\s+[^>]*?class\s*=\s*["\'][^"\']*?(?:next|pagination-next|page-next)[^"\']*?["\'][^>]*?href\s*=\s*["\']([^"\']+)["\']'),
-    # page=N pattern in links with "next" context
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']*?page=\d+[^"\']*)["\'][^>]*?class\s*=\s*["\'][^"\']*?next[^"\']*?["\']'),
-    # Chinese page number links: 第X页 where X > current
-    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*(?:\u7b2c?\s*\d+\s*\u9875?)\s*</a>'),
-]
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*'
+               r'(?:下一页|下一頁|后页|後頁|下页|下頁|次页)\s*</a>', re.DOTALL),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*'
+               r'(?:next|next page|older|more|›|»|→|≫|▶|>>|&gt;&gt;|&raquo;)\s*</a>', re.DOTALL),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*?'
+               r'class\s*=\s*["\'][^"\']*?(?:next|pagination-next|page-next|btn-next|'
+               r'next-page|pager-next)[^"\']*?["\']'),
+    re.compile(r'(?i)<a\s+[^>]*?class\s*=\s*["\'][^"\']*?(?:next|pagination-next|page-next|'
+               r'next-page|pager-next)[^"\']*?["\'][^>]*?href\s*=\s*["\']([^"\']+)["\']'),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']*?[?&](?:page|p|paged|pg|offset|start)='
+               r'\d+[^"\']*)["\'][^>]*?class\s*=\s*["\'][^"\']*?next[^"\']*?["\']'),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']+)["\'][^>]*>\s*'
+               r'(?:第?\s*\d+\s*页?)\s*</a>'),
+    re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\']*/page/\d+/?[^"\']*)["\']'),
+)
+
+_PAGE_NUMBER_RE = re.compile(r"(?i)[?&](?:page|p|paged|pg|offset|start)=(\d+)")
 
 
-def find_next_page_url(html: str, base_url: str) -> str | None:
-    """Find the next page URL from pagination links."""
+def find_next_page_url(html: str, base_url: str,
+                       visited: set[str] | None = None) -> str | None:
+    """Find the "next page" link, preferring forward-only candidates."""
+    current_page = _current_page_number(base_url)
+
     for pattern in _NEXT_PAGE_PATTERNS:
-        match = pattern.search(html)
-        if match:
+        for match in pattern.finditer(html or ""):
             url = _normalize_url(match.group(1), base_url)
-            if url and url != base_url:
-                return url
+            if not url or url == base_url:
+                continue
+            if visited and url in visited:
+                continue
+            next_page = _current_page_number(url)
+            if current_page is not None and next_page is not None and next_page <= current_page:
+                continue
+            return url
     return None
 
 
-_LINK_PATTERN = re.compile(
-    r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\'#]+)["\']'
-)
+def _current_page_number(url: str) -> int | None:
+    match = _PAGE_NUMBER_RE.search(url)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    path_match = re.search(r"/page/(\d+)", url)
+    if path_match:
+        return int(path_match.group(1))
+    return None
 
-_SKIP_EXTENSIONS = {
-    '.css', '.js', '.json', '.xml', '.rss', '.atom', '.txt',
-    '.ico', '.robots', '.sitemap', '.map',
-}
+
+# ── Link discovery for recursive crawls ─────────────────────────────────────
+
+_LINK_PATTERN = re.compile(r'(?i)<a\s+[^>]*?href\s*=\s*["\']([^"\'#]+)["\']')
 
 
-def extract_page_links(html: str, base_url: str,
-                       same_domain: bool = True,
-                       allowed_paths: list[str] = None) -> list[str]:
-    """Extract all <a href> links from a page for crawling."""
-    base_parsed = urlparse(base_url)
-    base_domain = base_parsed.netloc
-    links = set()
+def extract_page_links(html: str, base_url: str, same_domain: bool = True,
+                       allowed_paths: list[str] | None = None,
+                       max_links: int | None = None) -> list[str]:
+    """Collect crawlable ``<a href>`` targets, most promising first."""
+    base_domain = urlparse(base_url).netloc
+    links: list[str] = []
+    seen: set[str] = set()
 
-    for match in _LINK_PATTERN.finditer(html):
-        raw_url = match.group(1).strip()
-        url = _normalize_url(raw_url, base_url)
+    for match in _LINK_PATTERN.finditer(html or ""):
+        raw = match.group(1).strip()
+        if raw.startswith(("#", "javascript:")):
+            continue
+        url = _normalize_url(raw, base_url)
         if not url:
             continue
-
         parsed = urlparse(url)
-        if parsed.scheme not in ('http', 'https'):
-            continue
         if same_domain and parsed.netloc != base_domain:
             continue
 
         path_lower = parsed.path.lower()
         if any(path_lower.endswith(ext) for ext in _SKIP_EXTENSIONS):
             continue
-        if raw_url.startswith(('#', 'javascript:')):
+        if any(path_lower.endswith(ext) for ext in _HTML_DOC_EXTENSIONS):
+            pass  # static pages are still crawlable
+        if any(word in path_lower for word in _SKIP_LINK_WORDS):
             continue
 
-        if allowed_paths:
-            if not any(path_lower.startswith(prefix.lower()) for prefix in allowed_paths):
-                continue
+        if allowed_paths and not any(
+                path_lower.startswith(prefix.lower()) for prefix in allowed_paths):
+            continue
 
-        url = url.split('#')[0]
-        if url:
-            links.add(url)
+        canonical = parsed._replace(fragment="").geturl()
+        if canonical in seen or canonical == base_url:
+            continue
+        seen.add(canonical)
+        links.append(canonical)
 
-    return list(links)
+    if max_links is not None:
+        return links[:max_links]
+    return links
 
 
 def extract_iframe_urls(html: str, base_url: str) -> list[str]:
-    """Extract iframe src URLs for further crawling."""
-    urls = []
-    for match in IFRAME_PATTERN.finditer(html):
-        url = _normalize_url(match.group(1), base_url)
-        if url and url.startswith(('http://', 'https://')):
-            urls.append(url)
+    """Iframe ``src`` values worth rendering or crawling."""
+    urls: list[str] = []
+    for match in IFRAME_PATTERN.finditer(html or ""):
+        resolved = _normalize_url(match.group(1), base_url)
+        if resolved and resolved not in urls:
+            urls.append(resolved)
     return urls
 
 
-# ── Meta refresh redirect detection ─────────────────────────────────────────
+# ── Meta refresh ────────────────────────────────────────────────────────────
 
 _META_REFRESH_PATTERN = re.compile(
-    r'(?i)<meta\s+[^>]*?http-equiv\s*=\s*["\']refresh["\'][^>]*?content\s*=\s*["\'][^"\']*?url=([^"\';\s]+)',
+    r'(?i)<meta\s+[^>]*?http-equiv\s*=\s*["\']refresh["\'][^>]*?content\s*=\s*'
+    r'["\'][^"\']*?url\s*=\s*([^"\';\s]+)',
     re.DOTALL,
 )
 _META_REFRESH_PATTERN2 = re.compile(
-    r'(?i)<meta\s+[^>]*?content\s*=\s*["\'][^"\']*?url=([^"\';\s]+)[^"\']*?["\'][^>]*?http-equiv\s*=\s*["\']refresh["\']',
+    r'(?i)<meta\s+[^>]*?content\s*=\s*["\'][^"\']*?url\s*=\s*([^"\';\s]+)[^"\']*?["\']'
+    r'[^>]*?http-equiv\s*=\s*["\']refresh["\']',
     re.DOTALL,
 )
 
 
 def find_meta_refresh_url(html: str, base_url: str) -> str | None:
-    """Detect <meta http-equiv="refresh" content="0;url=..."> redirects."""
+    """Detect ``<meta http-equiv="refresh">`` redirect targets."""
     for pattern in (_META_REFRESH_PATTERN, _META_REFRESH_PATTERN2):
-        match = pattern.search(html)
+        match = pattern.search(html or "")
         if match:
-            url = _normalize_url(match.group(1), base_url)
-            if url and url.startswith(('http://', 'https://')):
-                return url
+            resolved = _normalize_url(match.group(1), base_url)
+            if resolved:
+                return resolved
     return None
 
 
-# ── <noscript> and <template> content extraction ────────────────────────────
-
-_NOSCRIPT_PATTERN = re.compile(r'(?i)<noscript>(.*?)</noscript>', re.DOTALL)
-_TEMPLATE_PATTERN = re.compile(r'(?i)<template>(.*?)</template>', re.DOTALL)
-
-
-def extract_noscript_template_urls(html: str, base_url: str) -> list[str]:
-    """Extract media URLs from <noscript> and <template> tags.
-
-    Sites like Pinterest/Instagram put real image URLs in <noscript> fallbacks.
-    <template> tags may contain lazy-loaded content not yet in the DOM.
-    """
-    urls = set()
-    for pattern in (_NOSCRIPT_PATTERN, _TEMPLATE_PATTERN):
-        for match in pattern.finditer(html):
-            inner = match.group(1)
-            # Reuse the main URL pattern on inner content
-            for url_match in URL_PATTERN.finditer(inner):
-                url = _normalize_url(url_match.group(1), base_url)
-                if url:
-                    urls.add(url)
-            for url_match in SOURCE_TAG_PATTERN.finditer(inner):
-                url = _normalize_url(url_match.group(1), base_url)
-                if url:
-                    urls.add(url)
-            for url_match in LAZY_LOAD_PATTERN.finditer(inner):
-                url = _normalize_url(url_match.group(1), base_url)
-                if url:
-                    urls.add(url)
-    return list(urls)
-
-
-# ── Manifest.json parsing ───────────────────────────────────────────────────
+# ── PWA manifest ────────────────────────────────────────────────────────────
 
 _MANIFEST_LINK_PATTERN = re.compile(
     r'(?i)<link\s+[^>]*?rel\s*=\s*["\']manifest["\'][^>]*?href\s*=\s*["\']([^"\']+)["\']'
@@ -733,112 +695,137 @@ _MANIFEST_LINK_PATTERN = re.compile(
 
 
 def find_manifest_url(html: str, base_url: str) -> str | None:
-    """Find the PWA manifest.json URL from <link rel="manifest">."""
-    match = _MANIFEST_LINK_PATTERN.search(html)
-    if match:
-        return _normalize_url(match.group(1), base_url)
-    return None
+    match = _MANIFEST_LINK_PATTERN.search(html or "")
+    return _normalize_url(match.group(1), base_url) if match else None
 
 
-# ── URL canonicalization (tracking param removal) ───────────────────────────
+# ── Canonicalisation for deduplication ──────────────────────────────────────
 
-_TRACKING_PARAMS = {
-    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-    'utm_id', 'utm_source_platform', 'utm_creative_format',
-    'fbclid', 'gclid', 'gclsrc', 'dclid', 'gbraid', 'wbraid',
-    'msclkid', 'twclid', 'li_fat_id',
-    'mc_cid', 'mc_eid',
-    'ref', 'referrer', 'source', 'spm', 'from', 'isappinstalled',
-    'scene', 'clickid', 'share_source', 'share_medium',
-    '_ga', '_gl', 'yclid', 'igshid',
-}
+_TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_source_platform", "utm_creative_format", "utm_name",
+    "fbclid", "gclid", "gclsrc", "dclid", "gbraid", "wbraid", "msclkid",
+    "twclid", "li_fat_id", "mc_cid", "mc_eid", "igshid", "yclid",
+    "ref", "referrer", "source", "spm", "from", "isappinstalled", "scene",
+    "clickid", "share_source", "share_medium", "_ga", "_gl",
+})
 
 
 def canonicalize_url(url: str) -> str:
-    """Remove tracking parameters from URL for deduplication.
-
-    Also normalizes:
-    - Removes trailing slashes from path
-    - Lowercases scheme and domain
-    - Removes fragment
-    """
+    """Produce a stable key for deduplication (tracking params stripped)."""
     parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-    netloc = parsed.netloc.lower()
-    path = parsed.path.rstrip('/') or '/'
-
-    # Remove tracking params
+    path = parsed.path.rstrip("/") or "/"
+    query = ""
     if parsed.query:
         from urllib.parse import parse_qs, urlencode
+
         params = parse_qs(parsed.query, keep_blank_values=True)
-        clean_params = {k: v for k, v in params.items()
-                       if k.lower() not in _TRACKING_PARAMS}
-        query = urlencode(clean_params, doseq=True) if clean_params else ''
-    else:
-        query = ''
-
-    return f"{scheme}://{netloc}{path}" + (f"?{query}" if query else '')
+        clean = {k: v for k, v in params.items() if k.lower() not in _TRACKING_PARAMS}
+        query = urlencode(clean, doseq=True) if clean else ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}" + (
+        f"?{query}" if query else "")
 
 
-# ── Encoding detection helper ───────────────────────────────────────────────
+# ── Encoding detection ──────────────────────────────────────────────────────
+
+_CHARSET_ALIASES = {
+    "gb2312": "gb18030",     # superset, decodes gb2312 and gbk correctly
+    "gbk": "gb18030",
+    "gb_2312-80": "gb18030",
+    "big5": "big5hkscs",     # superset
+    "shift_jis": "shift_jis",
+    "sjis": "shift_jis",
+    "iso-8859-1": "cp1252",  # browsers treat latin-1 as cp1252
+    "latin1": "cp1252",
+    "ascii": "utf-8",
+    "utf8": "utf-8",
+}
+
+# Common Chinese/Japanese pages frequently mislabel their charset; if we see
+# this many multi-byte sequences we prefer a UTF-8 decode.
+_CHARSET_META_RE = re.compile(
+    rb'(?i)<meta[^>]+charset\s*=\s*["\']?\s*([a-zA-Z0-9_\-]+)')
+_CHARSET_HTTP_EQUIV_RE = re.compile(
+    rb'(?i)<meta[^>]+content\s*=\s*["\'][^"\']*charset\s*=\s*([a-zA-Z0-9_\-]+)')
+
 
 def detect_encoding(resp_headers: dict, body: bytes) -> str:
-    """Detect encoding from Content-Type header or body sniffing.
+    """Pick a decoding for a response body.
 
-    Priority:
-    1. Content-Type charset parameter
-    2. HTML <meta charset="...">
-    3. BOM detection
-    4. Default utf-8
+    Order: explicit header charset → HTML ``<meta charset>`` → BOM → UTF-8.
+    Alias mapping means ``gb2312``/``gbk`` decode as ``gb18030`` (a superset)
+    and ``iso-8859-1`` as ``cp1252``, which is what browsers do.
     """
-    # 1. Content-Type header
-    ct = resp_headers.get('content-type', '')
-    ct_match = re.search(r'charset=([^\s;]+)', ct, re.IGNORECASE)
-    if ct_match:
-        return ct_match.group(1).strip().strip('"\'').lower()
+    headers_lower = {str(k).lower(): v for k, v in (resp_headers or {}).items()}
+    content_type = headers_lower.get("content-type", "") or ""
+    match = re.search(r"charset\s*=\s*([^\s;]+)", content_type, re.IGNORECASE)
+    if match:
+        return _canonical_charset(match.group(1).strip().strip("\"'"))
 
-    # 2. HTML meta charset (look in first 4KB)
-    head = body[:4096]
-    meta_match = re.search(
-        rb'(?i)<meta[^>]+charset=["\']?([^"\'\s;>]+)', head)
-    if meta_match:
-        return meta_match.group(1).decode('ascii', errors='ignore').lower()
+    head = (body or b"")[:4096]
+    for pattern in (_CHARSET_META_RE, _CHARSET_HTTP_EQUIV_RE):
+        meta = pattern.search(head)
+        if meta:
+            return _canonical_charset(meta.group(1).decode("ascii", errors="ignore"))
 
-    # 3. BOM detection
-    if body.startswith(b'\xef\xbb\xbf'):
-        return 'utf-8-sig'
-    if body.startswith(b'\xff\xfe'):
-        return 'utf-16-le'
-    if body.startswith(b'\xfe\xff'):
-        return 'utf-16-be'
+    if body:
+        if body.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        if body.startswith(b"\xff\xfe\x00\x00"):
+            return "utf-32-le"
+        if body.startswith(b"\x00\x00\xfe\xff"):
+            return "utf-32-be"
+        if body.startswith(b"\xff\xfe"):
+            return "utf-16-le"
+        if body.startswith(b"\xfe\xff"):
+            return "utf-16-be"
 
-    # 4. Default
-    return 'utf-8'
+    return "utf-8"
 
 
-# ── Content-Type to extension mapping ───────────────────────────────────────
+def _canonical_charset(name: str) -> str:
+    lowered = name.strip().lower()
+    if not lowered:
+        return "utf-8"
+    return _CHARSET_ALIASES.get(lowered, lowered)
+
+
+def decode_body(body: bytes, resp_headers: dict | None = None) -> tuple[str, str]:
+    """Decode a response body, falling back gracefully on bad bytes."""
+    encoding = detect_encoding(resp_headers or {}, body)
+    try:
+        return body.decode(encoding, errors="replace"), encoding
+    except (LookupError, UnicodeDecodeError):
+        return body.decode("utf-8", errors="replace"), "utf-8"
+
+
+# ── Content-Type → extension ────────────────────────────────────────────────
 
 _CT_EXTENSION_MAP = {
-    'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
-    'image/webp': '.webp', 'image/svg+xml': '.svg', 'image/avif': '.avif',
-    'image/bmp': '.bmp', 'image/tiff': '.tiff',
-    'video/mp4': '.mp4', 'video/webm': '.webm', 'video/x-flv': '.flv',
-    'video/x-matroska': '.mkv', 'video/quicktime': '.mov',
-    'video/MP2T': '.ts',
-    'audio/mpeg': '.mp3', 'audio/ogg': '.ogg', 'audio/wav': '.wav',
-    'audio/flac': '.flac', 'audio/aac': '.aac', 'audio/mp4': '.m4a',
-    'audio/opus': '.opus',
-    'application/pdf': '.pdf',
-    'application/zip': '.zip',
-    'application/x-rar-compressed': '.rar',
-    'application/x-7z-compressed': '.7z',
-    'application/gzip': '.gz',
-    'font/woff': '.woff', 'font/woff2': '.woff2',
-    'application/font-woff': '.woff', 'application/font-woff2': '.woff2',
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
+    "image/avif": ".avif", "image/bmp": ".bmp", "image/tiff": ".tiff",
+    "image/heic": ".heic", "image/x-icon": ".ico",
+    "video/mp4": ".mp4", "video/webm": ".webm", "video/x-flv": ".flv",
+    "video/x-matroska": ".mkv", "video/quicktime": ".mov", "video/mp2t": ".ts",
+    "video/x-msvideo": ".avi",
+    "audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/wav": ".wav",
+    "audio/x-wav": ".wav", "audio/flac": ".flac", "audio/aac": ".aac",
+    "audio/mp4": ".m4a", "audio/opus": ".opus",
+    "application/pdf": ".pdf", "application/zip": ".zip",
+    "application/x-rar-compressed": ".rar", "application/vnd.rar": ".rar",
+    "application/x-7z-compressed": ".7z", "application/gzip": ".gz",
+    "application/x-tar": ".tar", "application/epub+zip": ".epub",
+    "application/vnd.apple.mpegurl": ".m3u8", "application/x-mpegurl": ".m3u8",
+    "application/dash+xml": ".mpd",
+    "font/woff": ".woff", "font/woff2": ".woff2", "font/ttf": ".ttf",
+    "font/otf": ".otf", "application/font-woff": ".woff",
+    "application/font-woff2": ".woff2",
 }
 
 
 def guess_extension_from_content_type(content_type: str) -> str | None:
-    """Guess file extension from Content-Type header."""
-    ct = content_type.split(';')[0].strip().lower()
-    return _CT_EXTENSION_MAP.get(ct)
+    """Guess a file extension from a Content-Type header."""
+    if not content_type:
+        return None
+    return _CT_EXTENSION_MAP.get(content_type.split(";")[0].strip().lower())

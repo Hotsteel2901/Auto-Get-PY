@@ -1,0 +1,15 @@
+{
+  "context_servers": {
+    "auto-get-py": {
+      "command": {
+        "path": "python",
+        "args": [
+          "mcp_server.py"
+        ]
+      },
+      "settings": {
+        "AUTO_GET_BASE_URL": "http://localhost:8000"
+      }
+    }
+  }
+}

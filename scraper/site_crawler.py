@@ -117,26 +117,27 @@ async def _parse_sitemap(url: str, urls: list, headers: dict,
     ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
     tag = root.tag.lower()
 
+    def _locations(paths: tuple[str, ...]) -> list[str]:
+        """Resolve every <loc> against the sitemap URL.
+
+        Real sitemaps use absolute URLs, but relative entries do appear in the
+        wild and would otherwise be queued as un-fetchable paths.
+        """
+        found: list[str] = []
+        for path in paths:
+            for element in root.findall(path, ns):
+                if element.text and element.text.strip():
+                    found.append(urljoin(url, element.text.strip()))
+        return found
+
     if 'sitemapindex' in tag:
-        # Sitemap index — recurse into each child sitemap
-        for sitemap in root.findall('.//sm:sitemap/sm:loc', ns):
-            if sitemap.text:
-                await _parse_sitemap(sitemap.text.strip(), urls, headers,
-                                      timeout, proxy, max_depth, depth + 1)
-        # Also try without namespace
-        for sitemap in root.findall('.//sitemap/loc'):
-            if sitemap.text:
-                await _parse_sitemap(sitemap.text.strip(), urls, headers,
-                                      timeout, proxy, max_depth, depth + 1)
+        children = _locations(('.//sm:sitemap/sm:loc', './/sitemap/loc'))
+        for child in dict.fromkeys(children):
+            await _parse_sitemap(child, urls, headers,
+                                  timeout, proxy, max_depth, depth + 1)
     elif 'urlset' in tag:
-        # Regular sitemap
-        for url_elem in root.findall('.//sm:url/sm:loc', ns):
-            if url_elem.text:
-                urls.append(url_elem.text.strip())
-        # Without namespace
-        for url_elem in root.findall('.//url/loc'):
-            if url_elem.text:
-                urls.append(url_elem.text.strip())
+        for location in _locations(('.//sm:url/sm:loc', './/url/loc')):
+            urls.append(location)
 
 
 # ── RSS / Atom feeds ────────────────────────────────────────────────────────
@@ -184,6 +185,13 @@ async def fetch_feed(feed_url: str, headers: dict = None,
     except Exception:
         return result
 
+    def absolute(value: str | None) -> str | None:
+        """Feed entries are often relative to the feed's own location."""
+        if not value:
+            return None
+        value = value.strip()
+        return value if value.startswith(("http://", "https://")) else urljoin(feed_url, value)
+
     try:
         root = ET.fromstring(text)
     except ET.ParseError:
@@ -201,64 +209,69 @@ async def fetch_feed(feed_url: str, headers: dict = None,
     for item in root.findall('.//item'):
         link = item.find('link')
         if link is not None and link.text:
-            result["page_urls"].append(link.text.strip())
+            resolved = absolute(link.text)
+            if resolved:
+                result["page_urls"].append(resolved)
 
         # <enclosure url="..." type="audio/mpeg">
         for enc in item.findall('enclosure'):
-            enc_url = enc.get('url')
-            if enc_url:
-                result["media_urls"].append(enc_url)
+            resolved = absolute(enc.get('url'))
+            if resolved:
+                result["media_urls"].append(resolved)
 
         # <media:content url="...">
         for mc in item.findall('media:content', ns):
-            mc_url = mc.get('url')
-            if mc_url:
-                result["media_urls"].append(mc_url)
+            resolved = absolute(mc.get('url'))
+            if resolved:
+                result["media_urls"].append(resolved)
 
         # <media:thumbnail url="...">
         for mt in item.findall('media:thumbnail', ns):
-            mt_url = mt.get('url')
-            if mt_url:
-                result["media_urls"].append(mt_url)
+            resolved = absolute(mt.get('url'))
+            if resolved:
+                result["media_urls"].append(resolved)
 
         # <itunes:image href="...">
         for it in item.findall('itunes:image', ns):
-            it_url = it.get('href')
-            if it_url:
-                result["media_urls"].append(it_url)
+            resolved = absolute(it.get('href'))
+            if resolved:
+                result["media_urls"].append(resolved)
 
         # <content:encoded> — may contain HTML with media
         for ce in item.findall('content:encoded', ns):
             if ce.text:
-                # Extract URLs from embedded HTML
-                for m in re.finditer(
-                    r'(?i)(?:src|href)\s*=\s*["\']([^"\']+)["\']', ce.text
-                ):
-                    url = m.group(1)
-                    if url.startswith(('http://', 'https://')):
-                        result["media_urls"].append(url)
+                for match in re.finditer(
+                        r'(?i)(?:src|href)\s*=\s*["\']([^"\']+)["\']', ce.text):
+                    resolved = absolute(match.group(1))
+                    if resolved:
+                        result["media_urls"].append(resolved)
 
     # Atom
     for entry in root.findall('atom:entry', ns):
         for link in entry.findall('atom:link', ns):
-            href = link.get('href')
             rel = link.get('rel', 'alternate')
-            if href and rel == 'alternate':
-                result["page_urls"].append(href)
+            if rel != 'alternate':
+                continue
+            resolved = absolute(link.get('href'))
+            if resolved:
+                result["page_urls"].append(resolved)
 
         # <media:content> in Atom entries
         for mc in entry.findall('media:content', ns):
-            mc_url = mc.get('url')
-            if mc_url:
-                result["media_urls"].append(mc_url)
+            resolved = absolute(mc.get('url'))
+            if resolved:
+                result["media_urls"].append(resolved)
 
     # Also try without namespace (some feeds don't use them)
     for item in root.findall('.//entry'):
         for link in item.findall('link'):
-            href = link.get('href')
-            if href:
-                result["page_urls"].append(href)
+            resolved = absolute(link.get('href'))
+            if resolved:
+                result["page_urls"].append(resolved)
 
+    # De-duplicate while preserving order.
+    result["page_urls"] = list(dict.fromkeys(result["page_urls"]))
+    result["media_urls"] = list(dict.fromkeys(result["media_urls"]))
     return result
 
 

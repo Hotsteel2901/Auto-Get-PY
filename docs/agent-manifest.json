@@ -1,0 +1,223 @@
+{
+  "service": "Auto-Get-PY",
+  "version": "1.1.0",
+  "description": "Local media scraper: crawl a site, download every asset.",
+  "base_url": "http://localhost:8000",
+  "canonical_prefix": "/api/agent",
+  "aliases": [
+    "/api/agent",
+    "/api/aider",
+    "/api/amp",
+    "/api/claude",
+    "/api/cline",
+    "/api/codex",
+    "/api/continue",
+    "/api/copilot",
+    "/api/cursor",
+    "/api/dsh",
+    "/api/gemini",
+    "/api/hermes",
+    "/api/jules",
+    "/api/opencode",
+    "/api/roo",
+    "/api/windsurf",
+    "/api/zed"
+  ],
+  "auth": {
+    "type": "none",
+    "note": "Local single-user service."
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/scrape",
+      "purpose": "Crawl a page/site and download everything found. Returns a `task_id`, or the final result when `wait=true`."
+    },
+    {
+      "method": "POST",
+      "path": "/quick",
+      "purpose": "Discover media URLs only — nothing is written to disk. Use this to preview before downloading."
+    },
+    {
+      "method": "POST",
+      "path": "/direct",
+      "purpose": "Playwright render + immediate download, synchronous. Best for single JS-heavy pages."
+    },
+    {
+      "method": "POST",
+      "path": "/fetch",
+      "purpose": "Download one exact URL. No crawling."
+    },
+    {
+      "method": "GET",
+      "path": "/status/{task_id}",
+      "purpose": "Progress, per-status download counts, error."
+    },
+    {
+      "method": "GET",
+      "path": "/results/{task_id}",
+      "purpose": "Final file list with paths and sizes."
+    },
+    {
+      "method": "POST",
+      "path": "/cancel/{task_id}",
+      "purpose": "Stop a running task and free its workers."
+    },
+    {
+      "method": "GET",
+      "path": "/tasks",
+      "purpose": "Recent tasks."
+    },
+    {
+      "method": "GET",
+      "path": "/files",
+      "purpose": "Files on disk, newest first."
+    },
+    {
+      "method": "GET",
+      "path": "/manifest",
+      "purpose": "Machine-readable capability + endpoint manifest."
+    },
+    {
+      "method": "GET",
+      "path": "/agents",
+      "purpose": "Every supported agent and its URL alias."
+    },
+    {
+      "method": "GET",
+      "path": "/skill",
+      "purpose": "This document, served as markdown (`?agent=<id>`)."
+    }
+  ],
+  "capabilities": [
+    "html-extraction",
+    "json-ld",
+    "srcset",
+    "lazy-load",
+    "css-urls",
+    "noscript-template",
+    "pagination",
+    "recursive-crawl",
+    "sitemap",
+    "robots",
+    "rss-atom",
+    "iframe",
+    "playwright-render",
+    "network-capture",
+    "cookies",
+    "referer",
+    "hls-merge",
+    "hls-aes128",
+    "dash-merge",
+    "resume",
+    "retry-backoff",
+    "rate-limit-handling",
+    "decryptors"
+  ],
+  "agents": [
+    {
+      "id": "generic",
+      "name": "Any MCP/HTTP agent",
+      "alias": "/api/agent",
+      "skill_url": "/api/agent/skill?agent=generic"
+    },
+    {
+      "id": "hermes",
+      "name": "Hermes Agent",
+      "alias": "/api/hermes",
+      "skill_url": "/api/agent/skill?agent=hermes"
+    },
+    {
+      "id": "opencode",
+      "name": "opencode",
+      "alias": "/api/opencode",
+      "skill_url": "/api/agent/skill?agent=opencode"
+    },
+    {
+      "id": "dsh",
+      "name": "DeepSeek Harness (dsh / dsh-tui)",
+      "alias": "/api/dsh",
+      "skill_url": "/api/agent/skill?agent=dsh"
+    },
+    {
+      "id": "codex",
+      "name": "OpenAI Codex CLI",
+      "alias": "/api/codex",
+      "skill_url": "/api/agent/skill?agent=codex"
+    },
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "alias": "/api/claude",
+      "skill_url": "/api/agent/skill?agent=claude"
+    },
+    {
+      "id": "gemini",
+      "name": "Gemini CLI",
+      "alias": "/api/gemini",
+      "skill_url": "/api/agent/skill?agent=gemini"
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "alias": "/api/cursor",
+      "skill_url": "/api/agent/skill?agent=cursor"
+    },
+    {
+      "id": "copilot",
+      "name": "GitHub Copilot",
+      "alias": "/api/copilot",
+      "skill_url": "/api/agent/skill?agent=copilot"
+    },
+    {
+      "id": "cline",
+      "name": "Cline",
+      "alias": "/api/cline",
+      "skill_url": "/api/agent/skill?agent=cline"
+    },
+    {
+      "id": "roo",
+      "name": "Roo Code",
+      "alias": "/api/roo",
+      "skill_url": "/api/agent/skill?agent=roo"
+    },
+    {
+      "id": "windsurf",
+      "name": "Windsurf",
+      "alias": "/api/windsurf",
+      "skill_url": "/api/agent/skill?agent=windsurf"
+    },
+    {
+      "id": "continue",
+      "name": "Continue",
+      "alias": "/api/continue",
+      "skill_url": "/api/agent/skill?agent=continue"
+    },
+    {
+      "id": "aider",
+      "name": "Aider",
+      "alias": "/api/aider",
+      "skill_url": "/api/agent/skill?agent=aider"
+    },
+    {
+      "id": "zed",
+      "name": "Zed",
+      "alias": "/api/zed",
+      "skill_url": "/api/agent/skill?agent=zed"
+    },
+    {
+      "id": "amp",
+      "name": "Amp",
+      "alias": "/api/amp",
+      "skill_url": "/api/agent/skill?agent=amp"
+    },
+    {
+      "id": "jules",
+      "name": "Jules",
+      "alias": "/api/jules",
+      "skill_url": "/api/agent/skill?agent=jules"
+    }
+  ],
+  "openapi_url": "/openapi.json",
+  "docs_url": "/docs"
+}

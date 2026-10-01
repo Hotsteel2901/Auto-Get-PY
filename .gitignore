@@ -1,9 +1,29 @@
+# Virtual environments
 .venv/
 venv/
+env/
+
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.db
+*.py[cod]
+*.egg-info/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Databases and scraped output
+*.db
+*.db-wal
+*.db-shm
 downloads/*
 !downloads/.gitkeep
+
+# Node (only used by the optional front-end harness)
+node_modules/
+package-lock.json
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
